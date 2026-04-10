@@ -15,7 +15,7 @@ from PIL import Image
 
 from scene import Scene, GaussianModel
 from arguments import ModelParams, PipelineParams
-from gspim_renderer import GSPIMRenderer
+from gspim.renderer import GSPIMRenderer
 from utils.general_utils import safe_state
 
 

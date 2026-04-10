@@ -14,9 +14,9 @@ import os
 
 from scene import Scene, GaussianModel
 from gaussian_renderer import render
-from gspim_renderer import GSPIMRenderer, print_stage_timing_statistics
+from gspim.renderer import GSPIMRenderer, print_stage_timing_statistics
 from arguments import ModelParams, PipelineParams
-from gspim_profiler import GSPIMProfiler
+from gspim.profiler import GSPIMProfiler
 from utils.image_utils import psnr
 from utils.loss_utils import ssim
 
