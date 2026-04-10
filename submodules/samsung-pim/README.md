@@ -10,7 +10,7 @@ Copyright (C) 2021 Samsung Electronics Co. LTD
 [Restricted to non-commercial / academic research use]
 
 Original repository: internal Samsung research distribution.  
-Contact: s-h.kang@samsung.com, s.h.cha@samsung.com
+Contact: Samsung Memory Research Team (see original distribution).
 
 ## How to obtain the full simulator
 
