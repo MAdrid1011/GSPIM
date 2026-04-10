@@ -1,0 +1,33 @@
+# Python
+*.pyc
+*.pyo
+__pycache__/
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+develop-eggs/
+.Python
+
+# Compiled CUDA extensions
+*.so
+*.o
+
+# Data and outputs (not tracked)
+data/
+output/
+
+# Build artifacts from editable installs
+pointops2/pointops2.egg-info/
+submodules/simple-knn/simple_knn.egg-info/
+submodules/diff-gaussian-rasterization/diff_gaussian_rasterization.egg-info/
+
+# SIBR viewer (optional dependency)
+SIBR_viewers/
+
+# Editor
+.vscode/
+
+# Misc
+*.dump
