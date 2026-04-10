@@ -7,3 +7,7 @@
 [submodule "submodules/vggt"]
 	path = submodules/vggt
 	url = https://github.com/facebookresearch/vggt
+
+[submodule "submodules/samsung-pim"]
+	path = submodules/samsung-pim
+	url = https://github.com/SAITPublic/PIMSimulator
