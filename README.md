@@ -263,25 +263,6 @@ Extensions load lazily via JIT; if compilation fails (CUDA version mismatch), Py
 
 ---
 
-## Ablation Groups
-
-Following Section 8.1 of the paper, the five incremental optimizations are:
-
-| Group | Optimization |
-|-------|-------------|
-| G1 | PIM-side temporal contribution filtering (PPIM + Active Loader) |
-| G2 | Batch-major multi-frame rendering dataflow |
-| G3 | Depth-stability differentiated sorting |
-| G4 | GPU batch-wise Gaussian prefetching (double-buffering) |
-| G5 | Adaptive window width sizing |
-
-Run ablation estimation:
-```bash
-python ablation_estimator.py --scene coffee_martini --model_path output/N3V/coffee_martini
-```
-
----
-
 ## Hardware Configuration
 
 Evaluated on NVIDIA H100 80GB + 6-stack HBM3 (Table 2 of the paper):
