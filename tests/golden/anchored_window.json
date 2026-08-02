@@ -1,0 +1,16 @@
+{
+  "fixture_version": 1,
+  "window": {"start": 0.0, "end": 5.0},
+  "active_ids": [100, 101],
+  "stable_ids": [100, 101],
+  "unstable_ids": [],
+  "rols": [[100, 101], [100, 101], [100, 101], [100, 101], [100, 101]],
+  "batch_bytes": [280],
+  "checksums": [
+    "6947e977db00a43a84ebf4dda14a5bf1478759637ae3b213a92932ac81ca04ff",
+    "ba84fafc25217d8afc5ba45de2ead90f95645a70a565c83b436309d0a24313c8",
+    "013132f3d888afa6e21b158a56b5db052081b8d1efbd2ed6306fb89cf92a0c9d",
+    "6fc16abfabf6ece591cda768639a3538ea61086909cc941aa8ceca90816368ad",
+    "eee9bdafb7153183bdb015250ded7c1f1acde90b9eac4568bfd977b5d5ed92db"
+  ]
+}

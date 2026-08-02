@@ -1,0 +1,18 @@
+{
+  "fixture_version": 1,
+  "window_sizes": [4, 2],
+  "next_window_sizes": [3, 2],
+  "checksums": [
+    [
+      "dcac10aec05e87aaf7370b8c60044d62b6bd4c889694aaae8c4d5a4b185f7704",
+      "0eeaa4a6a5225746ad9cef6d039c3d443d70a557b68bc5fe387c925003a84159",
+      "8328c92479555a65396f13aea48650c9d4983ca5e93e9f89332a8d3fa8b61c01",
+      "bad32a3f71dff9e8970255c14bb37321e77f744f4c2867504ba134f598e3229c"
+    ],
+    [
+      "d544bbd37ec900213e7bc932809121937adef4359e7f5331a08b8dbcbaffe498",
+      "de815a123ba7c22099135fdca4bd68af1bf3fd878a04351c93c826f1937a0775"
+    ]
+  ],
+  "required_edges": [["w0:s3-window", "w1:s1-select-d0"]]
+}

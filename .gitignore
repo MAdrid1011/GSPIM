@@ -10,24 +10,37 @@ build/
 develop-eggs/
 .Python
 
-# Compiled CUDA extensions
+# Native build artifacts
 *.so
 *.o
 
 # Data and outputs (not tracked)
 data/
+datasets/
 output/
-
-# Build artifacts from editable installs
-pointops2/pointops2.egg-info/
-submodules/simple-knn/simple_knn.egg-info/
-submodules/diff-gaussian-rasterization/diff_gaussian_rasterization.egg-info/
-
-# SIBR viewer (optional dependency)
-SIBR_viewers/
 
 # Editor
 .vscode/
 
 # Misc
 *.dump
+
+# Private paper material: retain locally, never publish from this repository.
+/hpca2027-latex-template/
+/GCC.pdf
+/#813 - ASPLOS'27 - April cycle.pdf
+/REACT3D.pdf
+
+# Local-only workload checkouts, generated RTL, traces, and measurements.
+/baselines/
+/third_party/
+/submodules/
+/artifacts/
+/out/
+/rtl/verilog/
+/hardware/generated/
+
+# Local Chisel build products and test waveforms.
+/hardware/target/
+/hardware/test_run_dir/
+/hardware/project/target/

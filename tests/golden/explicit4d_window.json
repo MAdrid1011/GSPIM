@@ -1,0 +1,24 @@
+{
+  "fixture_version": 1,
+  "window": {"start": 0.0, "end": 5.0},
+  "active_ids": [0, 2],
+  "stable_ids": [0],
+  "unstable_ids": [2],
+  "rols": [[0, 2], [0, 2], [0, 2], [0, 2], [0, 2]],
+  "batch_bytes": [304],
+  "checksums": [
+    "dcac10aec05e87aaf7370b8c60044d62b6bd4c889694aaae8c4d5a4b185f7704",
+    "0eeaa4a6a5225746ad9cef6d039c3d443d70a557b68bc5fe387c925003a84159",
+    "8328c92479555a65396f13aea48650c9d4983ca5e93e9f89332a8d3fa8b61c01",
+    "bad32a3f71dff9e8970255c14bb37321e77f744f4c2867504ba134f598e3229c",
+    "ba50f4cdb9ed87fe8b69c975d270f51c31cf39b5b09c91c13c20d21ebbf335f6"
+  ],
+  "required_edges": [
+    ["w0:s1-reorg-d0:bank0-b0", "w0:s2-d0-bank0-b0"],
+    ["w0:s2-d0-bank0-b0", "w0:s3-gpu-d0-bank0-b0"],
+    ["w0:s3-gpu-d0-bank0-b0", "w0:s3-select-d0-bank0-b0"],
+    ["w0:s3-window", "w0:s4"],
+    ["w0:s5-pack-0-d0", "w0:s5-render-0"],
+    ["w0:s5-pack-0-d1", "w0:s5-render-0"]
+  ]
+}
