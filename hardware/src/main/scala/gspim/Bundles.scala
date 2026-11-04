@@ -35,7 +35,7 @@ object ReorgPurposeId {
   val batch: UInt = 3.U(2.W)
 }
 
-/** Reserved LPDDR control addresses are artifact parameters, never timing-model inputs. */
+/** Reserved LPDDR control addresses for task and model-load transactions. */
 object LpddrControlAddress {
   val programWrite: BigInt = BigInt("ffff0000", 16)
   val layoutWrite: BigInt = BigInt("ffff0004", 16)
@@ -48,8 +48,7 @@ class PimTaskReq(p: GspimParams) extends Bundle {
   val taskId = UInt(16.W)
   val kind = UInt(1.W)
   val die = UInt(log2Ceil(p.diesPerPackage * p.packages).W)
-  // A die-level command covers a contiguous PIM-bank scope.  `bank` is its
-  // first bank; `bankCount` prevents the old one-bank-per-task shortcut.
+  // A die-level command covers `bankCount` contiguous PIM banks starting at `bank`.
   val bank = UInt(log2Ceil(p.pimBanksPerDie).W)
   val bankCount = UInt(log2Ceil(p.pimBanksPerDie + 1).W)
   val program = UInt(log2Ceil(p.programSlots).W)

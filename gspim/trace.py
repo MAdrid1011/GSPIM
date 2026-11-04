@@ -27,6 +27,3 @@ class TaskTrace:
 
     def has_dependency(self, parent: str, child: str) -> bool:
         return child in self.nodes and parent in self.nodes[child].dependencies
-
-    def to_dict(self) -> dict[str, object]:
-        return {"nodes": [{"name": node.name, "kind": node.kind, "depends_on": list(node.dependencies)} for node in self.nodes.values()]}

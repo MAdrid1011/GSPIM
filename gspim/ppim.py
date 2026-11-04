@@ -1,4 +1,4 @@
-"""Executable PPIM programs with the paper's fixed-point decision rules."""
+"""Executable PPIM programs with fixed-point decision rules."""
 
 from __future__ import annotations
 
@@ -13,32 +13,6 @@ class ProgramId(str, Enum):
     KEYFRAME_RANGE = "KEYFRAME_RANGE"
     ANCHOR_OVERLAP = "ANCHOR_OVERLAP"
     DEPTH_STABLE = "DEPTH_STABLE"
-
-
-class PPIMOperation(str, Enum):
-    ROT_SLICE = "ROT_SLICE"
-    SCALE = "SCALE"
-    DOT = "DOT"
-    WINDOW_DIST = "WINDOW_DIST"
-    CMP_LE = "CMP_LE"
-    LOAD = "LOAD"
-    CMP_LT = "CMP_LT"
-    AND = "AND"
-    CMP_GT = "CMP_GT"
-
-
-@dataclass(frozen=True)
-class PPIMProgram:
-    program_id: ProgramId
-    operations: tuple[PPIMOperation, ...]
-
-
-PROGRAMS = {
-    ProgramId.TEMP_ACTIVITY: PPIMProgram(ProgramId.TEMP_ACTIVITY, (PPIMOperation.ROT_SLICE, PPIMOperation.SCALE, PPIMOperation.DOT, PPIMOperation.WINDOW_DIST, PPIMOperation.CMP_LE)),
-    ProgramId.KEYFRAME_RANGE: PPIMProgram(ProgramId.KEYFRAME_RANGE, (PPIMOperation.LOAD, PPIMOperation.CMP_LT, PPIMOperation.CMP_LT, PPIMOperation.AND)),
-    ProgramId.ANCHOR_OVERLAP: PPIMProgram(ProgramId.ANCHOR_OVERLAP, (PPIMOperation.LOAD, PPIMOperation.CMP_LT, PPIMOperation.CMP_LT, PPIMOperation.AND)),
-    ProgramId.DEPTH_STABLE: PPIMProgram(ProgramId.DEPTH_STABLE, (PPIMOperation.CMP_GT,)),
-}
 
 
 @dataclass(frozen=True)

@@ -171,17 +171,184 @@ class ReferenceRenderer:
         checksum_input = "|".join(f"{value:.9f}" for pixel in colors for value in pixel).encode("ascii")
         return RenderedFrame(camera.width, camera.height, tuple(colors), tuple(transmittance), tuple(order), tiles, sha256(checksum_input).hexdigest())
 
-    def render_batches(
-        self,
-        batches: Sequence[Batch],
-        cameras: Sequence[Camera],
-        packed_batches: Sequence[HCFResult],
-        gpu_fallback_records: Sequence[Sequence[object]],
-    ) -> tuple[RenderedFrame, ...]:
-        if len(packed_batches) != len(batches) or len(gpu_fallback_records) != len(batches):
-            raise ValueError("every render batch requires packed and fallback data")
 
-        session = self.begin_batches(cameras)
-        for batch, packed, fallback_records in zip(batches, packed_batches, gpu_fallback_records):
-            session.consume(batch, packed, fallback_records)
-        return session.finish()
+class CUDARenderer:
+    """Native GPU operators shared by frame-by-frame and multi-frame execution."""
+
+    def __init__(self, cache, model=None):
+        from pathlib import Path
+        import os
+
+        import torch
+        from torch.utils.cpp_extension import load
+
+        cache = Path(cache).resolve()
+        source_root = Path(__file__).resolve().parents[1]
+        if cache == source_root or source_root in cache.parents:
+            raise ValueError("CUDA cache must be outside the source checkout")
+        cache.mkdir(parents=True, exist_ok=True)
+        # gsplat also respects this location when its installed wheel needs JIT.
+        os.environ["TORCH_EXTENSIONS_DIR"] = str(cache)
+        os.environ.setdefault("MAX_JOBS", "2")
+        self.ops = load("gspim_renderer", [str(Path(__file__).with_suffix(".cu"))], extra_cuda_cflags=["-O3"], verbose=False)
+        self.torch = torch
+        self.generation_model = model if hasattr(model, "motion_rotation") else None
+        self.generation_parameters = (self.ops.prepare_generation(
+            model.motion, model.motion_rotation, model.opacity_variance, model.interval,
+            float(model.config["var_pad"]),
+        ) if self.generation_model is not None else None)
+        if self.generation_parameters is not None:
+            # Finish immutable checkpoint preparation before another stream
+            # can submit inference through this renderer.
+            torch.cuda.current_stream(model.xyz.device).synchronize()
+
+    def generate(self, model, times):
+        if hasattr(model, "anchor_positions"):
+            torch = self.torch
+            features = model.anchor_features
+            decoded = model.covariance_mlp(features).reshape(-1, 10, 12)
+            opacity = model.opacity_mlp(features)
+            direction = torch.nn.functional.normalize(
+                model.anchor_positions[:, :3]-model.camera_position, dim=-1)
+            model.decoded_colors = model.color_mlp(
+                torch.cat((features, direction), -1)).reshape(-1, 3)
+            return self.ops.generate_anchored(
+                model.anchor_positions, model.anchor_offsets, model.anchor_log_scales,
+                decoded, opacity, model.anchor_static, times, model.tau_t)
+        if hasattr(model, "temporal_means"):
+            return self.ops.generate_4d(
+                model.xyz, model.scales4d, model.rotation_l, model.rotation_r,
+                model.temporal_means, model.opacity, model.masks, model.source_ids,
+                model.source_count, times)
+        motion, rotation, variance = (self.generation_parameters if model is self.generation_model
+                                     else (model.motion, model.motion_rotation, model.opacity_variance))
+        return self.ops.generate(model.xyz, model.displacement, motion, model.rotation,
+                                 rotation, model.scales, model.opacity,
+                                 model.opacity_center, variance, times,
+                                 model.duration, model.interval, model.time_shift, float(model.config["var_pad"]))
+
+    def project(self, model, geometry, defer_colors=False):
+        from gsplat.cuda._wrapper import fully_fused_projection
+
+        torch = self.torch
+        means, covariance, opacity = geometry
+        width = len(means)
+        if means.shape[1] == 0:
+            # gsplat's projection launcher requires at least one primitive.
+            # Keep empty windows on the normal ordering/compositing path.
+            xy = means.new_empty((width, 0, 2))
+            return (xy.to(torch.int32), xy, opacity.new_empty((width, 0)),
+                    means.new_empty((width, 0, 3)),
+                    means.new_empty(0) if defer_colors else means.new_empty((width, 0, 3)),
+                    opacity)
+        views = model.view[None].expand(width, -1, -1, -1).contiguous()
+        intrinsics = model.intrinsics[None].expand(width, -1, -1, -1).contiguous()
+        temporal = hasattr(model, "temporal_means")
+        classic = temporal or hasattr(model, "anchor_positions")
+        radii, xy, depth, conics, compensation = fully_fused_projection(
+            means, covariance, None, None, views, intrinsics, model.width, model.height,
+            eps2d=float(model.config["kernel_size"]), near_plane=float(model.config["near"]),
+            far_plane=float(model.config["far"]), packed=False, opacities=opacity,
+            calc_compensations=not classic,
+        )
+        radii, xy, depth, conics = [value.squeeze(1) for value in (radii, xy, depth, conics)]
+        # Native Ex4DGS rejects centers outside this expanded camera frustum.
+        if not classic:
+            opacity = self.ops.projection_finish(xy, radii, opacity, compensation.squeeze(1), model.width, model.height)
+        if defer_colors:
+            return radii, xy, depth, conics, means.new_empty(0), opacity
+        colors = self.colors(model, means, radii)
+        return radii, xy, depth, conics, colors, opacity
+
+    def colors(self, model, means, radii):
+        if hasattr(model, "anchor_positions"):
+            return model.decoded_colors[None].expand(len(means), -1, -1).contiguous()
+        if hasattr(model, "temporal_means"):
+            return self.ops.temporal_colors(
+                model.xyz, radii, model.sh, model.camera_position,
+                model.frame_times, model.temporal_means)
+        return self.ops.batch_colors(means, radii, model.sh, model.camera_position)
+
+    def frame(self, model, projected):
+        from gsplat.cuda._wrapper import isect_tiles, isect_offset_encode, rasterize_to_pixels
+
+        radii, xy, depth, conics, colors, opacity = projected
+        tile_width, tile_height = (model.width + 15) // 16, (model.height + 15) // 16
+        _, keys, ids = isect_tiles(xy, radii, depth, 16, tile_width, tile_height,
+                                  segmented=False, sort=True)
+        offsets = isect_offset_encode(keys, 1, tile_width, tile_height)
+        image, _ = rasterize_to_pixels(
+            xy, conics, colors, opacity, model.width, model.height, 16, offsets, ids,
+            backgrounds=xy.new_full((1, 3), float(model.config.get("background", 1))),
+        )
+        return image[0]
+
+    def _tile_records(self, model, projected, orders, assignment, batches, shared):
+        radii, xy, _, conics, _, opacity = projected
+        count = orders.shape[1]
+        tile_width, tile_height = (model.width + 15) // 16, (model.height + 15) // 16
+        id_bits = count.bit_length() if shared else 0
+        keys, ids = self.ops.ordered_tiles(xy, radii, orders if shared else orders.contiguous(), assignment, batches, tile_width, tile_height, 16, shared)
+        return self.ops.cull_tiles(keys, ids, xy, conics, opacity, tile_width, tile_height, 16, 0, radii, id_bits)
+
+    def window(self, model, projected, orders, assignment, batches, shared=False, means=None, sh=None, ordered_attributes=False, source_ids=None, layout=None, output=None, wait_for=None, tile_records=None):
+        torch = self.torch
+        radii, xy, _, conics, colors, opacity = projected
+        width, count = orders.shape
+        tile_width, tile_height = (model.width + 15) // 16, (model.height + 15) // 16
+        id_bits = count.bit_length() if shared else 0
+        # Input is enumerated in ROL order; a stable radix grouping on tile and
+        # batch bits retains that order without sorting frame depths again.
+        keys, ids = (self._tile_records(model, projected, orders, assignment, batches, shared)
+                     if tile_records is None else tile_records)
+        image_groups = batches if shared else batches * width
+        keys, ids = self.ops.radix(
+            keys, ids, 0,
+            (tile_width * tile_height).bit_length() + image_groups.bit_length(),
+        )
+        # The masked compositor accepts packed batch/tile keys and replaces
+        # them with coordinates before launching CTAs. Other paths use linear jobs.
+        packed_jobs = shared and width > 1 and id_bits > 0 and id_bits + width + 8 <= 32
+        jobs, offsets, counts = self.ops.tile_ranges(
+            keys, 1 if shared else width, batches, tile_width * tile_height, 0, packed_jobs)
+        boundaries = (torch.searchsorted(assignment[0], torch.arange(batches + 1, device=orders.device))
+                      .cpu().tolist()) if means is not None or (shared and ordered_attributes) else []
+        # Metadata may overlap the preceding span; GPU batch preparation and
+        # composition start only after that span's render completes.
+        if wait_for is not None:
+            torch.cuda.current_stream(xy.device).wait_event(wait_for)
+        temporal = hasattr(model, "temporal_means")
+        color_means = model.xyz[None] if temporal else means
+        return self.ops.batches(xy, conics, colors, opacity, offsets, ids,
+                                model.width, model.height, batches, jobs, counts,
+                                ids.numel() > 64 * len(jobs), id_bits,
+                                color_means if means is not None else xy.new_empty(0),
+                                model.sh if sh is None else sh, model.camera_position, orders, boundaries,
+                                ordered_attributes, orders.new_empty(0) if source_ids is None else source_ids,
+                                orders.new_empty(0) if layout is None else layout,
+                                xy.new_empty(0) if output is None else output,
+                                float(model.config.get("background", 1)),
+                                model.frame_times if temporal else None,
+                                model.temporal_means if temporal else None)
+
+
+def cuda_image_quality(image, target):
+    """PSNR and RGB SSIM with the upstream 11x11 Gaussian window."""
+    import torch
+    import torch.nn.functional as functional
+
+    image = image.clamp(0, 1).permute(2, 0, 1)[None]
+    target = target.permute(2, 0, 1)[None]
+    psnr = -10 * (image - target).square().mean().log10()
+    coordinates = torch.arange(11, device=image.device, dtype=image.dtype) - 5
+    gaussian = torch.exp(-coordinates.square() / (2 * 1.5 ** 2))
+    gaussian /= gaussian.sum()
+    kernel = (gaussian[:, None] * gaussian[None, :])[None, None].expand(3, 1, 11, 11).contiguous()
+    moments = functional.conv2d(torch.cat((image, target, image.square(), target.square(), image * target)), kernel, padding=5, groups=3)
+    mean_a, mean_b, square_a, square_b, product = moments.unbind(0)
+    variance_a = square_a - mean_a.square()
+    variance_b = square_b - mean_b.square()
+    covariance = product - mean_a * mean_b
+    numerator = (2 * mean_a * mean_b + 0.01 ** 2) * (2 * covariance + 0.03 ** 2)
+    denominator = (mean_a.square() + mean_b.square() + 0.01 ** 2) * (variance_a + variance_b + 0.03 ** 2)
+    return float(psnr.item()), float((numerator / denominator).mean().item())

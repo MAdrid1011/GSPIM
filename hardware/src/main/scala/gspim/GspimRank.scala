@@ -74,8 +74,8 @@ class GspimRank(p: GspimParams = GspimParams()) extends Module {
     val programReadInstruction = Output(Vec(p.microProgramLength, UInt(p.microInstructionWidth.W)))
     val activeLayout = Output(Vec(PpimLayoutField.count, UInt(rowFieldIndexWidth.W)))
 
-    // The paper-visible host boundary is standard LPDDR WRITE/READ traffic to
-    // reserved control addresses.  No direct task or model-load bypass exists.
+    // The host issues task and model-load transactions through standard LPDDR
+    // WRITE/READ traffic to reserved control addresses.
     val lpddrWrite = Flipped(Decoupled(new LpddrControlWrite(p)))
     val lpddrReadRequest = Input(Bool())
     val lpddrReadAddress = Input(UInt(32.W))
@@ -130,9 +130,8 @@ class GspimRank(p: GspimParams = GspimParams()) extends Module {
     reorgSelectionProgram := completedSelectProgram
   }
 
-  // The paper places a program buffer and static-layout table beside every
-  // PIM-bank row buffer.  A broadcast model-load write initializes all banks;
-  // targeted writes make per-bank layout differences observable in RTL tests.
+  // Each PIM bank has a program buffer and static-layout table. Model-load
+  // writes initialize all banks by broadcast or update a targeted bank.
   val programBuffers = Seq.fill(p.pimBanksPerDie)(Module(new PPIMProgramBuffer(p)))
   val layoutBuffers = Seq.fill(p.pimBanksPerDie)(Module(new PPIMLayoutBuffer(p)))
   lpddrAdapter.io.programWrite.ready := true.B

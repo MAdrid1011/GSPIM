@@ -1,6 +1,6 @@
-# Independent Reference Model
+# Independent algorithm references
 
-This directory contains independent semantic oracles for the fixed Explicit4D,
-Ex4DGS, and Anchored fixtures. It must not import the `gspim` implementation.
-Tests compare selection, S2--S5 dataflow, and rendering results against the
-public implementation; HCF payload movement has separate transaction tests.
+These modules implement selection, geometry, render ordering, batching, and image
+composition independently of `gspim`. Design tests compare computed values directly
+against these references. HCF and runtime tests exercise payload movement and task
+transactions separately. See [architecture](../docs/architecture.md).

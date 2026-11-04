@@ -1,4 +1,4 @@
-"""Runnable functional reference for the GSPIM paper mechanisms."""
+"""CUDA dataflow and functional models of GSPIM mechanisms."""
 
 from .config import ArchitectureConfig
 from .pipeline import GSPIMPipeline, SequenceResult, WindowResult

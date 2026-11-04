@@ -4,7 +4,7 @@ import unittest
 
 
 class RuntimeTests(unittest.TestCase):
-    """The runtime is a dependency protocol rather than a latency model."""
+    """Task dependencies and memory visibility govern GPU/PIM execution."""
 
     def test_task_completion_carries_real_output_and_visibility_is_enforced(self):
         from gspim.hcf import LiveRange, ReorgPurpose

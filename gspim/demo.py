@@ -1,79 +1,89 @@
-"""Run deterministic mechanism fixtures and emit images plus dependency traces."""
+"""Run the registered CUDA workloads or prepare their inputs."""
 
 from __future__ import annotations
 
 import argparse
-import json
+import http.client
+import subprocess
 from pathlib import Path
+import sys
+import zipfile
 
-from .layouts.anchored import Anchored4DGSLayout
-from .layouts.ex4dgs import Ex4DGSLayout
-from .layouts.explicit4d import Explicit4DLayout
-from .model import Camera, FrameRequest
-from .pipeline import GSPIMPipeline
-
-
-def _camera() -> Camera:
-    return Camera.from_mapping({"world_to_camera": ((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0)), "focal_x": 8.0, "focal_y": 8.0, "center_x": 4.0, "center_y": 4.0, "width": 8, "height": 8, "tile_size": 4, "near": 0.1, "far": 10.0})
-
-
-def _covariance() -> tuple[tuple[float, float, float], ...]:
-    return ((0.04, 0.0, 0.0), (0.0, 0.04, 0.0), (0.0, 0.0, 0.04))
-
-
-def _explicit() -> Explicit4DLayout:
-    rotation = ((1.0, 0.0, 0.0, 0.0), (0.0, 1.0, 0.0, 0.0), (0.0, 0.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0))
-    return Explicit4DLayout.from_mappings((
-        {"primitive_id": 0, "temporal_mean": 1.0, "temporal_rotation": rotation, "temporal_scale": (0.2, 0.2, 0.2, 0.5), "mean": (-0.2, 0.0, 2.0), "opacity": 0.6, "color": (0.9, 0.1, 0.1), "attribute_bytes": 48, "die": 0, "bank": 0, "block": 0, "slot": 0},
-        {"primitive_id": 1, "temporal_mean": 4.4, "temporal_rotation": rotation, "temporal_scale": (0.2, 0.2, 0.2, 1.0), "mean": (0.1, 0.0, 3.0), "opacity": 0.5, "color": (0.1, 0.2, 0.9), "attribute_bytes": 56, "die": 1, "bank": 1, "block": 0, "slot": 0},
-    ))
-
-
-def _ex4dgs() -> Ex4DGSLayout:
-    return Ex4DGSLayout.from_mappings((
-        {"primitive_id": 10, "is_static": True, "keyframes": ({"timestamp": 0.0, "mean": (0.0, 0.0, 2.2), "covariance": _covariance(), "opacity": 0.5, "color": (0.7, 0.7, 0.2)},), "attribute_bytes": 44, "die": 0, "bank": 0, "block": 0, "slot": 0},
-        {"primitive_id": 11, "is_static": False, "keyframes": ({"timestamp": 0.0, "mean": (0.1, 0.0, 2.8), "covariance": _covariance(), "opacity": 0.7, "color": (0.2, 0.8, 0.8)}, {"timestamp": 5.0, "mean": (0.1, 0.0, 3.5), "covariance": _covariance(), "opacity": 0.4, "color": (0.1, 0.4, 0.9)}), "attribute_bytes": 52, "die": 0, "bank": 0, "block": 0, "slot": 1},
-    ))
-
-
-def _anchored() -> Anchored4DGSLayout:
-    return Anchored4DGSLayout.from_mappings(({"anchor_id": 20, "start": 0.0, "end": 3.0, "binding_start": 100, "binding_count": 2, "die": 0, "bank": 1, "block": 0, "slot": 0},), {
-        100: {"frame_geometry": tuple({"timestamp": float(t), "mean": (-0.1, 0.0, 2.1), "covariance": _covariance(), "opacity": 0.5, "color": (0.6, 0.2, 0.6)} for t in range(6)), "attribute_bytes": 40, "die": 0, "bank": 3, "block": 0, "slot": 0},
-        101: {"frame_geometry": tuple({"timestamp": float(t), "mean": (0.1, 0.0, 2.6 + 0.02 * t), "covariance": _covariance(), "opacity": 0.5, "color": (0.2, 0.6, 0.6)} for t in range(6)), "attribute_bytes": 40, "die": 0, "bank": 3, "block": 0, "slot": 1},
-    })
-
-
-def _write_ppm(path: Path, frame) -> None:
-    payload = bytearray()
-    for color in frame.pixels:
-        payload.extend(max(0, min(255, round(component * 255.0))) for component in color)
-    path.write_bytes(f"P6\n{frame.width} {frame.height}\n255\n".encode("ascii") + bytes(payload))
+from integrations.manifest import CACHE, FRAMES, ROOT, SCENES, WORKLOADS, combinations
+from .prepare import input_problems, prepare
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Run deterministic GSPIM mechanism fixtures")
-    parser.add_argument("--workload", choices=("explicit4d", "ex4dgs", "anchored", "all"), default="all")
-    parser.add_argument("--out", type=Path, required=True)
+    parser = argparse.ArgumentParser(description="Prepare inputs or run GSPIM CUDA workloads")
+    parser.add_argument("--prepare", action="store_true", help="prepare public data and check supplied models")
+    parser.add_argument("--workload", choices=(*WORKLOADS, "all"), default="all")
+    parser.add_argument("--scene", choices=(*SCENES, "all"), default="all")
+    parser.add_argument("--out", type=Path, help="report directory (default: outputs/<workload>/<scene>)")
+    parser.add_argument("--checkpoint", type=Path, help="single-combination model override")
+    parser.add_argument("--images", type=Path, help="single-combination held-out image override")
+    parser.add_argument("--cache", type=Path, default=CACHE, help="external compilation/download cache")
+    parser.add_argument("--frames", type=int, default=FRAMES)
+    parser.add_argument("--repeats", type=int, default=4)
+    parser.add_argument("--warmup", type=int, default=20, help="number of warmup windows")
     args = parser.parse_args(argv)
-    layouts = {"explicit4d": _explicit, "ex4dgs": _ex4dgs, "anchored": _anchored}
-    names = tuple(layouts) if args.workload == "all" else (args.workload,)
-    args.out.mkdir(parents=True, exist_ok=True)
-    camera = _camera()
-    frames = tuple(FrameRequest(float(index), camera) for index in range(6))
-    summary: dict[str, object] = {}
-    for name in names:
-        result = GSPIMPipeline(l2_capacity=512).run_sequence(
-            layouts[name](), frames, initial_window_size=4, frame_period=1.0,
-        )
-        checksums: list[str] = []
-        for window_index, window in enumerate(result.windows):
-            for frame_index, frame in enumerate(window.rendered_frames):
-                _write_ppm(args.out / f"{name}-w{window_index}-f{frame_index}.ppm", frame)
-                checksums.append(frame.checksum)
-        (args.out / f"{name}-trace.json").write_text(json.dumps(result.trace.to_dict(), indent=2), encoding="ascii")
-        summary[name] = {"checksums": checksums, "windows": len(result.windows)}
-    (args.out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="ascii")
-    print(f"wrote mechanism outputs for {', '.join(names)} to {args.out}")
+    if not 2 <= args.frames <= FRAMES or args.repeats < 1 or args.warmup < 1:
+        parser.error("frames must be in 2..300; repeats and warmup must be positive")
+    cache = args.cache.resolve()
+    if cache == ROOT or ROOT in cache.parents:
+        parser.error("--cache must be outside the checkout")
+    if args.out is not None:
+        output = args.out.resolve()
+        allowed = ROOT / "outputs"
+        if (output == ROOT or ROOT in output.parents) and output != allowed and allowed not in output.parents:
+            parser.error("outputs inside the checkout must be under outputs/")
+    pairs = tuple(combinations(args.workload, args.scene))
+    if (args.checkpoint or args.images) and len(pairs) != 1:
+        parser.error("--checkpoint and --images require a single --workload and --scene")
+    if args.prepare and (args.checkpoint or args.images or args.out):
+        parser.error("--prepare uses the registered input paths; path overrides apply to rendering")
+    if args.prepare:
+        try:
+            problems = prepare(pairs, cache=args.cache)
+        except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError, http.client.HTTPException, zipfile.BadZipFile) as error:
+            print(f"Preparation failed: {error}", file=sys.stderr)
+            return 1
+    else:
+        problems = input_problems(pairs, frames=args.frames, checkpoint=args.checkpoint, images=args.images)
+    if problems:
+        print("Missing inputs:\n" + "\n".join(f"- {item}" for item in problems), file=sys.stderr)
+        return 1
+    if args.prepare:
+        print("Inputs are ready.")
+        return 0
+
+    import gc
+    import torch
+    from .pipeline import CUDAPipeline
+
+    if not torch.cuda.is_available():
+        parser.error("a CUDA device is required; see docs/setup.md")
+    for workload, scene in pairs:
+        checkpoint = args.checkpoint or workload.checkpoint(scene)
+        images = args.images or workload.image_directory(scene)
+        output = args.out or ROOT / "outputs"
+        if len(pairs) != 1 or args.out is None:
+            output = output / workload.name / scene
+        print(f"Running {workload.name}/{scene}", flush=True)
+        if workload.name == "explicit4d":
+            from integrations.explicit4d import Explicit4DCheckpoint
+            model = Explicit4DCheckpoint(checkpoint, images)
+        elif workload.name == "anchored":
+            from integrations.anchored import AnchoredCheckpoint
+            model = AnchoredCheckpoint(checkpoint, images)
+        else:
+            from integrations.ex4dgs import Ex4DGSCheckpoint
+            model = Ex4DGSCheckpoint(checkpoint)
+        pipeline = CUDAPipeline(model, args.cache)
+        pipeline.evaluate(images, output, args.frames, args.repeats, args.warmup)
+        print(f"Report: {output / 'summary.md'}", flush=True)
+        del pipeline, model
+        gc.collect()
+        torch.cuda.empty_cache()
     return 0
 
 

@@ -2,11 +2,11 @@
 
 import unittest
 
-from tests.fixtures import CAMERA, EXPLICIT_RECORDS
+from tests.test_layouts import CAMERA, EXPLICIT_RECORDS
 
 
 class RendererTests(unittest.TestCase):
-    """The renderer must expose a real image instead of scalar compositing only."""
+    """Projection and compositing produce deterministic pixel images."""
 
     def test_projection_tiles_and_forward_compositing_are_deterministic(self):
         from gspim.layouts.explicit4d import Explicit4DLayout

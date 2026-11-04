@@ -1,46 +1,28 @@
-# Python
-*.pyc
-*.pyo
+# Python and package build products
 __pycache__/
+*.py[cod]
+.pytest_cache/
 *.egg
 *.egg-info/
 .eggs/
-dist/
 build/
-develop-eggs/
-.Python
+dist/
 
-# Native build artifacts
+# Native compilation products
 *.so
 *.o
 
-# Data and outputs (not tracked)
-data/
-datasets/
-output/
-
-# Editor
-.vscode/
-
-# Misc
-*.dump
-
-# Private paper material: retain locally, never publish from this repository.
-/hpca2027-latex-template/
-/GCC.pdf
-/#813 - ASPLOS'27 - April cycle.pdf
-/REACT3D.pdf
-
-# Local-only workload checkouts, generated RTL, traces, and measurements.
-/baselines/
+# Prepared inputs, pinned source checkouts and measured outputs
+/datasets/
+/checkpoints/
 /third_party/
-/submodules/
-/artifacts/
-/out/
-/rtl/verilog/
-/hardware/generated/
+/outputs/
 
-# Local Chisel build products and test waveforms.
+# Chisel build products, generated RTL and waveforms
+/hardware/generated/
 /hardware/target/
 /hardware/test_run_dir/
 /hardware/project/target/
+
+# Editor files
+.vscode/

@@ -1,4 +1,4 @@
-"""Paper-scoped representation adapters."""
+"""Typed Gaussian representation adapters for PPIM/HCF design models."""
 
 from .anchored import Anchored4DGSLayout
 from .ex4dgs import Ex4DGSLayout

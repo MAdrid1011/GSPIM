@@ -9,7 +9,7 @@ from typing import Mapping, Sequence
 
 
 def depth_stability_score(depths: Sequence[float], near: float, far: float) -> float:
-    """Compute the paper's exponential normalized mean absolute depth variation."""
+    """Compute exponential normalized mean absolute depth variation."""
 
     if far <= near:
         raise ValueError("far must exceed near")
@@ -100,9 +100,8 @@ def merge_path(
 ) -> tuple[int, ...]:
     """Partition a sorted merge by merge-path, then emit deterministic segments.
 
-    The partitions express the paper's parallel merge-path decomposition. This
-    functional artifact emits the independent segments serially and makes no
-    throughput claim.
+    Co-ranks divide the output into independent segments. Each segment merges
+    its corresponding slices with deterministic primitive-ID tie breaking.
     """
 
     total = len(stable) + len(unstable)
@@ -237,3 +236,138 @@ def make_batch_plan(
             raise AssertionError("greedy batch construction violated capacity")
         batches.append(Batch(batch_id, group, attributes, tuple(tuple(rol) for rol in per_frame), footprint))
     return tuple(batches)
+
+
+def cuda_render_orders(means, view, near: float, far: float, operators):
+    """Classify the native window and merge CUB-sorted stable/unstable IDs.
+
+    Sorting keys for the stable sequence are window minima, including during
+    the merge. Primitive ID breaks equal-depth ties in both paths.
+    """
+    import torch
+
+    if not isfinite(near) or not isfinite(far) or far <= near:
+        raise ValueError("depth stability requires finite, increasing camera bounds")
+    depth = (means @ view[0, 2, :3] + view[0, 2, 3]).contiguous()
+    width, count = depth.shape
+    score, minimum = operators.window_statistics(depth, far - near)
+    stable, unstable, next_delta = operators.classify(score)
+
+    def sort(values, keys):
+        # CUB transforms IEEE float keys internally, including negative depths.
+        return operators.radix(keys.contiguous(), values.contiguous(), 0, 32)[1]
+
+    stable = sort(stable, minimum[stable.long()])
+    if len(stable) == count:
+        orders = stable.long()[None].expand(width, -1)
+    else:
+        unstable = torch.stack([sort(unstable, depth[frame, unstable.long()]) for frame in range(width)]).contiguous()
+        orders = operators.merge(stable, unstable, minimum.contiguous(), depth)
+    return orders, next_delta, stable, depth
+
+
+def cuda_batch_boundaries(orders, stable_ids, projected, shared_bytes: int, l2_bytes: int, image_width: int, image_height: int, operators=None, shared_tiles=False, layout=None, resident_blocks=None, cost_prefix=None):
+    """Bound batch inputs after reserving all potentially resident tile state."""
+    import torch
+
+    width, count = orders.shape
+    device = orders.device
+    radii, xy = projected[:2]
+    properties = torch.cuda.get_device_properties(device)
+    tile_width, tile_height = (image_width + 15) // 16, (image_height + 15) // 16
+    masked = shared_tiles and count > 0 and width > 1 and count.bit_length() + width + 8 <= 32
+    if resident_blocks is None:
+        if operators is None:
+            raise ValueError("reference planning requires the device's resident block limit")
+        resident_blocks = operators.raster_blocks(xy, masked)
+    if resident_blocks < 1:
+        raise ValueError("resident block limit must be positive")
+    tiles = tile_width * tile_height
+    # C/T occupies registers while a CTA executes; conservatively also charge
+    # its backing storage. A signed T carries termination for multi-frame paths.
+    parts = 2 if masked else 1
+    resident_tiles = min(properties.multi_processor_count * resident_blocks, width * tiles * parts)
+    reserved = resident_tiles * (256 // parts) * (16 if width > 1 else 17)
+    reserved += width * tiles * (4 if masked else 1)
+    # Shared jobs have one tile list, while independent lists have one per frame.
+    reserved += (1 if shared_tiles else width) * tiles * (8 + 4) + 4
+    reserved += 16 if layout is not None else 0
+    budget = l2_bytes - reserved
+    if budget <= 0:
+        raise ValueError("L2 cannot hold the resident raster state")
+    if count == 0:
+        return orders.new_empty((width, 0)), 1, reserved
+    if shared_tiles and len(stable_ids) != count:
+        raise ValueError("shared tile lists require a common stable order")
+    if cost_prefix is not None and (operators is None or not shared_tiles or len(stable_ids) != count):
+        raise ValueError("actual tile costs require native shared-order batching")
+    if operators is not None and len(stable_ids) == count:
+        # All ROLs then share one sequence. Reduce exact per-record costs
+        # directly, avoiding W copies of ranks, gathers, and scatter atomics.
+        prefix = cost_prefix if cost_prefix is not None else operators.stable_batch_prefix(
+            orders, xy, radii, tile_width, tile_height, shared_bytes, shared_tiles,
+            orders.new_empty(0) if layout is None else layout,
+        )
+        # Search the identical greedy boundaries on-device; only two scalar
+        # planning results cross to the host instead of the complete prefix.
+        assignment, batches, maximum = operators.bounded_batches(prefix, budget, width)
+        return assignment, batches, maximum + reserved
+    else:
+        lower = ((xy - radii).div(16).floor()).clamp_min(0)
+        upper = ((xy + radii).div(16).ceil()).clamp_min(0)
+        lower[..., 0].clamp_max_(tile_width)
+        lower[..., 1].clamp_max_(tile_height)
+        upper[..., 0].clamp_max_(tile_width)
+        upper[..., 1].clamp_max_(tile_height)
+        visible = (radii > 0).all(-1)
+        if shared_tiles:
+            union_lower = torch.where(visible[..., None], lower,
+                                      lower.new_tensor((tile_width, tile_height))).amin(0)
+            union_upper = torch.where(visible[..., None], upper, 0).amax(0)
+            tile_bytes = (union_upper - union_lower).prod(-1).to(torch.int64) * 4
+            # Nine FP32 fields in every frame, plus one shared inverse ID.
+            attributes = width * 36 if layout is None else (layout[2, 1:] - layout[2, :-1]) * 4
+            costs = torch.where(visible.any(0), attributes + shared_bytes + 4 + tile_bytes, 0)
+            costs = costs[orders[0]]
+            bucket = torch.arange(count, device=device)
+        else:
+            intersections = ((upper - lower).prod(-1).to(torch.int64) * visible)
+            intersections = intersections.gather(1, orders)
+            # Radix scratch and keys die before composition. Only int32 tile
+            # IDs remain alongside the frame attributes and local orders.
+            local_bytes = 8 + 8 + 4 + 12 + 12 + 4 + 4
+            occurrence_bytes = local_bytes * visible.gather(1, orders) + intersections * 4
+            if len(stable_ids) == 0:
+                # No stable key can delimit a shared interval. Split the
+                # independent ROLs at rank boundaries, charging every frame's
+                # source attributes separately and retaining each full order.
+                bucket = torch.arange(count, device=device)
+                shared = shared_bytes * visible.gather(1, orders)
+                costs = (occurrence_bytes + shared).sum(0)
+            else:
+                rank_by_id = torch.full((count,), -1, device=device, dtype=torch.int64)
+                rank_by_id[stable_ids.long()] = torch.arange(len(stable_ids), device=device)
+                rank = rank_by_id[orders]
+                bucket = rank.cummax(dim=1).values.clamp_min(0)
+                shared = torch.where((rank < 0) & visible.gather(1, orders), shared_bytes, 0)
+                shared[0] = shared[0] + torch.where(
+                    (rank[0] >= 0) & visible.any(0)[orders[0]], shared_bytes, 0)
+                costs = torch.zeros(len(stable_ids), device=device, dtype=torch.int64)
+                costs.scatter_add_(0, bucket.flatten(), (occurrence_bytes + shared).flatten())
+        prefix = torch.cat((costs.new_zeros(1), costs.cumsum(0))).cpu().numpy()
+    from bisect import bisect_right
+    boundaries = [0]
+    maximum = 0
+    interval_count = len(prefix) - 1
+    while boundaries[-1] < interval_count:
+        start = boundaries[-1]
+        end = bisect_right(prefix, prefix[start] + budget, lo=start + 1) - 1
+        if end <= start:
+            raise ValueError("one render interval exceeds L2; reduce the window")
+        maximum = max(maximum, prefix[end] - prefix[start])
+        boundaries.append(end)
+    limits = torch.tensor(boundaries[1:], device=device, dtype=torch.int64)
+    assignment = torch.searchsorted(limits, bucket, right=True)
+    if assignment.ndim == 1:
+        assignment = assignment[None].expand(width, -1)
+    return assignment.contiguous(), len(boundaries) - 1, int(maximum) + reserved

@@ -47,9 +47,9 @@ class Ex4DGSLayout:
         required = ("primitive_id", "is_static", "keyframes", "attribute_bytes", "die", "bank", "block", "slot")
         converted: list[ExRecord] = []
         for value in records:
-            legacy = {"covariance", "opacity", "color"} & set(value)
-            if legacy:
-                raise ValueError(f"Ex4DGS rendering fields belong to keyframes: {', '.join(sorted(legacy))}")
+            misplaced = {"covariance", "opacity", "color"} & set(value)
+            if misplaced:
+                raise ValueError(f"Ex4DGS rendering fields belong to keyframes: {', '.join(sorted(misplaced))}")
             missing = [key for key in required if key not in value]
             if missing:
                 raise ValueError(f"Ex4DGS record is missing fields: {', '.join(missing)}")

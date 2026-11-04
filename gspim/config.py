@@ -1,4 +1,4 @@
-"""Artifact configuration for topology, fixed point, buffering, and rendering."""
+"""Configuration for topology, fixed point, buffering, and rendering."""
 
 from dataclasses import dataclass
 
@@ -24,7 +24,7 @@ class ArchitectureConfig:
         if self.pim_banks_per_die + self.reserved_banks_per_die != self.banks_per_die:
             raise ValueError("PIM and reserved banks must cover each die")
         if not 2 <= self.min_window_size <= self.max_window_size <= 5:
-            raise ValueError("window bounds must remain within the paper's 2--5 frame range")
+            raise ValueError("window bounds must remain within the 2--5 frame range")
         if self.l2_capacity_bytes < 1 or self.block_records < 1:
             raise ValueError("capacity and block_records must be positive")
         if self.local_index_bytes < 1 or self.raster_intermediate_bytes < 1:
