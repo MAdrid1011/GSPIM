@@ -8,9 +8,7 @@ import org.scalatest.matchers.should.Matchers
 class HcfSpec extends AnyFlatSpec with ChiselScalatestTester with Matchers {
   behavior of "HCF"
 
-  // HCF behavior is independent of the paper topology's replication factor.
-  // Keeping this unit fixture small makes the transaction test practical on
-  // the default Chisel simulator; `Generate` retains the paper configuration.
+  // A small topology exercises allocation, compaction, and fallback transactions.
   private val unitParams = GspimParams(
     packages = 1,
     diesPerPackage = 2,

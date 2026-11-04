@@ -1,18 +1,13 @@
-"""Independent five-stage fixture oracle for all three paper workload classes."""
+"""Independent five-stage algorithm reference for three Gaussian representations."""
 
 from __future__ import annotations
 
-from math import exp
 from typing import Callable, Mapping, Sequence
 
 from .contracts import ExpectedWindow
+from .dataflow import depth_stability
 from .renderer import render_checksum
 from .selection import explicit_active, explicit_geometry
-
-
-def _score(depths: Sequence[float], near: float, far: float) -> float:
-    normalized = [(value - near) / (far - near) for value in depths]
-    return 1.0 if len(normalized) < 2 else exp(-sum(abs(right - left) for left, right in zip(normalized, normalized[1:])) / (len(normalized) - 1))
 
 
 def _render_order(stable: Sequence[int], unstable: Sequence[int], stable_keys: Mapping[int, float], unstable_keys: Mapping[int, float]) -> tuple[int, ...]:
@@ -46,7 +41,7 @@ def _run_window(
         )
         for primitive_id in selected
     }
-    scores = {primitive_id: _score(values, float(camera["near"]), float(camera["far"])) for primitive_id, values in depths.items()}
+    scores = {primitive_id: depth_stability(values, float(camera["near"]), float(camera["far"])) for primitive_id, values in depths.items()}
     stable = {primitive_id for primitive_id, score in scores.items() if score > 0.98 + 1.0 / 65536.0}
     unstable_ids = set(selected) - stable
     minimum = {primitive_id: min(values) for primitive_id, values in depths.items()}
@@ -59,7 +54,7 @@ def _run_window(
     entries = sum(len(rol) for rol in rols)
     total = attribute_bytes + entries * 4 + entries * 16
     if total > capacity:
-        raise ValueError("golden fixture batch exceeds requested capacity")
+        raise ValueError("reference batch exceeds requested capacity")
     checksums = tuple(render_checksum(rol, geometry, camera) for rol, geometry in zip(rols, geometry_by_frame))
     return ExpectedWindow(set(selected), stable, unstable_ids, tuple(rols), (total,), checksums)
 
@@ -136,7 +131,7 @@ def _anchor_geometry(_primitive_id: int, record: Mapping[str, object], timestamp
                 "opacity": frame["opacity"],  # type: ignore[index]
                 "color": frame["color"],  # type: ignore[index]
             }
-    raise ValueError("anchor fixture has no generated geometry for the requested timestamp")
+    raise ValueError("anchor payload has no generated geometry for the requested timestamp")
 
 
 def run_anchored_window(

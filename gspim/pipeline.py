@@ -354,8 +354,8 @@ class GSPIMPipeline:
             active_reorg_by_die[die] = reorg_id
             active_region_by_die[die] = active_region
 
-        # The Active Index is an HCF result, including explicit GPU fallback
-        # suffixes, not a host-side pre-sort of source record locations.
+        # Assign Active Indices in HCF output order, including GPU fallback
+        # suffixes after each die's compacted prefix.
         active_index_order = tuple(
             primitive_id
             for die in sorted(active_results_by_die)
@@ -673,7 +673,7 @@ class GSPIMPipeline:
             raise ValueError("frame_period must be positive to define temporal window ends")
         window_size = initial_window_size or self.config.max_window_size
         if not self.config.min_window_size <= window_size <= self.config.max_window_size:
-            raise ValueError("initial_window_size is outside the paper's 2--5 range")
+            raise ValueError("initial_window_size is outside the configured window range")
         runtime = Runtime(self.config.total_dies)
         hcf = HierarchicalCompactionFabric(self.config.reserved_record_capacity_per_die)
         windows: dict[int, WindowResult] = {}
@@ -681,10 +681,9 @@ class GSPIMPipeline:
         def launch(offset: int, requested_size: int, window_id: int, previous_s3: str | None) -> None:
             remaining = len(values) - offset
             if remaining < self.config.min_window_size:
-                raise ValueError("sequence tail cannot form a paper-valid 2--5 frame window")
-            # The final drain remains a legal paper window.  A requested five-frame
-            # window over six remaining frames becomes four plus two rather than
-            # emitting a one-frame tail.
+                raise ValueError("sequence tail is shorter than the minimum window size")
+            # Reserve a complete final window: six remaining frames with a
+            # requested five-frame window become four plus two.
             if remaining <= self.config.max_window_size:
                 current_size = remaining
             else:
@@ -692,7 +691,7 @@ class GSPIMPipeline:
                 if remaining - current_size < self.config.min_window_size:
                     current_size -= self.config.min_window_size - (remaining - current_size)
             if not self.config.min_window_size <= current_size <= self.config.max_window_size:
-                raise ValueError("unable to form a paper-valid 2--5 frame window")
+                raise ValueError("unable to form a window within the configured bounds")
             current = values[offset:offset + current_size]
             if not current:
                 return
@@ -718,3 +717,315 @@ class GSPIMPipeline:
 
         launch(0, window_size, 0, None)
         return SequenceResult(tuple(windows[index] for index in sorted(windows)), runtime.trace)
+
+
+class CUDAPipeline:
+    """Independent-frame and multi-frame comparison on the current CUDA device."""
+
+    def __init__(self, model, cache) -> None:
+        import torch
+        from .renderer import CUDARenderer
+
+        self.model = model
+        self.renderer = CUDARenderer(cache, model)
+        self.projection_stream = torch.cuda.Stream(device=model.xyz.device)
+        self.l2_bytes = torch.cuda.get_device_properties(model.xyz.device).L2_cache_size
+
+    def dataflow(self, times, first=None):
+        import torch
+        from .dataflow import cuda_render_orders
+
+        model = self.model.select(times, first) if hasattr(self.model, "select") else self.model
+        generated = self.renderer.generate(model, times)
+        if hasattr(model, "anchor_positions"):
+            # A binding below the compositor's alpha cutoff in every frame
+            # cannot affect any pixel. Compact this window's decoded outputs
+            # before projection and ordering.
+            active = (generated[2] >= 1 / 255).any(0).nonzero().flatten()
+            generated = tuple(value.index_select(1, active) for value in generated)
+            model.decoded_colors = model.decoded_colors.index_select(0, active)
+        current = torch.cuda.current_stream(model.xyz.device)
+        self.projection_stream.wait_stream(current)
+        with torch.cuda.stream(self.projection_stream):
+            projected = self.renderer.project(model, generated, True)
+        for value in generated:
+            value.record_stream(self.projection_stream)
+        orders, adjustment, stable, depth = cuda_render_orders(
+            generated[0], model.view,
+            float(model.config.get("stability_near", model.config["near"])),
+            float(model.config.get("stability_far", model.config["far"])), self.renderer.ops,
+        )
+        shared_tiles = len(stable) == orders.shape[1]
+        current.wait_stream(self.projection_stream)
+        for value in projected:
+            value.record_stream(current)
+        if shared_tiles:
+            selected, crossed = self.renderer.ops.visible_order(stable, projected[0], depth)
+            if crossed:
+                if len(times) > 3:
+                    colors = self.renderer.colors(model, generated[0], projected[0])
+                    projected = (*projected[:4], colors, projected[5])
+                # A high SS does not rule out rank crossings. Preserve the
+                # external ready-window, but shorten its shared-order spans
+                # and center each span's key in time to reduce order bias.
+                width = len(times)
+                spans = ((0, 3), (3, 5)) if width == 5 else (
+                    ((0, 2), (2, 4)) if width == 4 else ((0, width),))
+                image = projected[1].new_empty((width, model.height, model.width, 4))
+                total_batches, maximum_footprint = 0, 0
+                # Prepare the next span while the first composites. Its
+                # compositor waits below so only one span composites at a time.
+                if len(spans) > 1:
+                    common_ready = torch.cuda.Event()
+                    common_ready.record(current)
+                    self.projection_stream.wait_event(common_ready)
+                    for value in (*generated, *projected, orders, selected, depth, image):
+                        value.record_stream(self.projection_stream)
+                render_done = None
+                for index, (first, last) in enumerate(spans):
+                    stream = self.projection_stream if index else current
+                    with torch.cuda.stream(stream):
+                        span_selected, _ = self.renderer.ops.visible_order(
+                            selected, projected[0][first:last], depth.new_empty(0))
+                        ordered_depth = depth[first:last, span_selected]
+                        key = ordered_depth.mean(0).contiguous()
+                        repaired = self.renderer.ops.radix(
+                            key, torch.arange(len(span_selected), dtype=torch.int32,
+                                              device=selected.device), 0, 32)[1]
+                        shared_order = span_selected[repaired.long()]
+                        local = tuple(value[first:last] if value.numel() else value
+                                      for value in projected)
+                        span_model = model
+                        if hasattr(model, "frame_times"):
+                            from copy import copy
+                            span_model = copy(model)
+                            span_model.frame_times = model.frame_times[first:last]
+                        _, batches, footprint = self._render_window(
+                            generated[0][first:last], local, orders[first:last],
+                            shared_order, True, image[first:last], shared_order,
+                            wait_for=render_done, model=span_model)
+                        if index == 0 and len(spans) > 1:
+                            render_done = torch.cuda.Event()
+                            render_done.record(current)
+                    total_batches += batches
+                    maximum_footprint = max(maximum_footprint, footprint)
+                if len(spans) > 1:
+                    current.wait_stream(self.projection_stream)
+                return image[..., :3], adjustment, total_batches, maximum_footprint
+        image, batches, footprint = self._render_window(
+            generated[0], projected, orders, stable, shared_tiles,
+            visible_ids=selected if shared_tiles else None, model=model)
+        return image, adjustment, batches, footprint
+
+    def _render_window(self, means, projected, orders, stable, shared_tiles,
+                       output=None, visible_ids=None, wait_for=None, model=None):
+        import torch
+        from .dataflow import cuda_batch_boundaries
+
+        model = self.model if model is None else model
+        defer_colors = shared_tiles and not hasattr(model, "anchor_positions")
+        if not defer_colors:
+            projected = (*projected[:4], self.renderer.colors(model, means, projected[0]), projected[5])
+        unstable_count = orders.shape[1] - len(stable)
+        if (hasattr(model, "anchor_positions") and not shared_tiles and
+                0 < unstable_count <= max(1, orders.shape[1] // 100)):
+            # Frame-owned unstable occurrences preserve every frame's ROL
+            # while letting the batch compositor consume one shared sequence.
+            source, owner = self.renderer.ops.shared_sequence(orders.contiguous(), stable)
+            projected = tuple(value.index_select(1, source) if value.numel() else value
+                              for value in projected)
+            live = (owner[None] < 0) | (owner[None] ==
+                    torch.arange(len(means), device=owner.device)[:, None])
+            projected = (projected[0] * live[..., None], *projected[1:])
+            stable = torch.arange(len(source), dtype=torch.int32, device=orders.device)
+            orders = stable.long()[None].expand(len(means), -1)
+            shared_tiles = True
+        sh = model.sh
+        source_ids = None
+        if shared_tiles:
+            if visible_ids is None:
+                selected, _ = self.renderer.ops.visible_order(
+                    stable, projected[0], projected[1].new_empty(0))
+            else:
+                selected = visible_ids
+            # Depth has already supplied the ROL; SH and means are read from
+            # their source arrays by each batch preparer.
+            projected = tuple(value.new_empty(0) if field == 2 else
+                              value.index_select(1, selected) if value.numel() else value
+                              for field, value in enumerate(projected))
+            source_ids = selected
+            stable = torch.arange(len(selected), dtype=torch.int32, device=orders.device)
+            orders = stable.long()[None].expand(len(means), -1)
+        # Preserve exact FP32 bits while compacting stable projection fields
+        # into a shared batch. The layout is lossless and only applies to the
+        # Dataflow path where the ROL is already common.
+        layout = (self.renderer.ops.packed_layout(
+            projected[1], projected[0], projected[3], projected[5],
+        ) if shared_tiles and projected[1].shape[1] else None)
+        # The preparer streams SH into per-frame RGB before compositing.
+        # Only the packed fields need to remain in the render working set.
+        shared_bytes = 0 if defer_colors else model.sh.shape[1] * 3 * 4
+        tile_records = cost_prefix = None
+        if layout is not None:
+            # Cull once before choosing boundaries, charging every packed
+            # attribute but only tile IDs that the compositor will access.
+            unassigned = orders.new_zeros((1, orders.shape[1])).expand_as(orders)
+            tile_records = self.renderer._tile_records(
+                model, projected, orders, unassigned, 1, True)
+            cost_prefix = self.renderer.ops.tile_batch_prefix(
+                layout, tile_records[1], orders.shape[1].bit_length())
+        assignment, batches, footprint = cuda_batch_boundaries(
+            orders, stable, projected, shared_bytes,
+            self.l2_bytes, model.width, model.height, self.renderer.ops, shared_tiles, layout,
+            cost_prefix=cost_prefix,
+        )
+        if tile_records is not None:
+            tile_bits = (((model.width + 15) // 16) *
+                         ((model.height + 15) // 16)).bit_length()
+            keys, ids = tile_records
+            keys = self.renderer.ops.tile_batch_keys(
+                keys, ids, assignment[0], orders.shape[1].bit_length(), tile_bits, batches)
+            tile_records = keys, ids
+        image = self.renderer.window(model, projected, orders, assignment, batches, shared_tiles,
+                                     means if defer_colors else None, sh, shared_tiles, source_ids, layout, output, wait_for, tile_records)
+        return image, batches, footprint
+
+    def baseline(self, time, first=None):
+        model = self.model.select(time, first) if hasattr(self.model, "select") else self.model
+        generated = self.renderer.generate(model, time)
+        return self.renderer.frame(model, self.renderer.project(model, generated))
+
+    def evaluate(self, images, output, frame_count: int, repeats: int = 4, warmup: int = 20) -> None:
+        """Measure actual frame completions and emit one Markdown report.
+
+        Both modes use the same adaptive ready-window partition determined by
+        an untimed prepass. Window-control work is repeated inside timed
+        Dataflow runs. Disk decoding and quality metrics run separately.
+        """
+        from pathlib import Path
+
+        import numpy as np
+        import torch
+        from PIL import Image
+        from .renderer import cuda_image_quality
+
+        if frame_count < 2 or frame_count > self.model.duration or repeats < 1 or warmup < 1:
+            raise ValueError("invalid frame count, repeats, or warmup")
+        images, output = Path(images), Path(output)
+        root = Path(__file__).resolve().parents[1]
+        destination = output.resolve()
+        allowed = root / "outputs"
+        if (destination == root or root in destination.parents) and destination != allowed and allowed not in destination.parents:
+            raise ValueError("outputs inside the checkout must be under outputs/")
+        targets = []
+        for frame in range(frame_count):
+            path = images / f"{getattr(self.model, 'image_prefix', '')}{frame:04d}.png"
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            targets.append(path)
+        times = torch.arange(frame_count, device=self.model.xyz.device, dtype=torch.float32)
+        windows = []
+        start, size = 0, 5
+        with torch.inference_mode():
+            while start < frame_count:
+                remaining = frame_count - start
+                current = min(size, remaining)
+                if remaining - current == 1:
+                    current -= 1
+                if current < 2:
+                    raise ValueError("sequence tail cannot form a two-frame window")
+                _, adjustment, _, _ = self.dataflow(times[start:start + current], start)
+                windows.append((start, current))
+                start += current
+                size = min(5, max(2, size + adjustment))
+            for index in range(warmup):
+                start, size = windows[index % len(windows)]
+                for frame in range(start, start + size):
+                    self.baseline(times[frame:frame + 1], frame)
+                self.dataflow(times[start:start + size], start)
+            torch.cuda.synchronize()
+            durations = {"baseline": [], "dataflow": []}
+            latencies = {name: [] for name in durations}
+            maximum_batches = maximum_footprint = 0
+            for repeat in range(repeats):
+                modes = tuple(durations) if repeat % 2 == 0 else tuple(reversed(durations))
+                for mode in modes:
+                    records = []
+                    begin = torch.cuda.Event(enable_timing=True)
+                    begin.record()
+                    for start, size in windows:
+                        ready = torch.cuda.Event(enable_timing=True)
+                        ready.record()
+                        completions = []
+                        if mode == "baseline":
+                            for frame in range(start, start + size):
+                                image = self.baseline(times[frame:frame + 1], frame)
+                                done = torch.cuda.Event(enable_timing=True)
+                                done.record()
+                                completions.append(done)
+                        else:
+                            image, _, batches, footprint = self.dataflow(times[start:start + size], start)
+                            maximum_batches = max(maximum_batches, batches)
+                            maximum_footprint = max(maximum_footprint, footprint)
+                            done = torch.cuda.Event(enable_timing=True)
+                            done.record()
+                            # All outputs become available after the batch-major drain.
+                            completions = [done] * size
+                        records.append((ready, completions))
+                    end = torch.cuda.Event(enable_timing=True)
+                    end.record()
+                    end.synchronize()
+                    durations[mode].append(begin.elapsed_time(end))
+                    latencies[mode].extend(ready.elapsed_time(done) for ready, events in records for done in events)
+                    print(f"{self.model.name} {mode} repeat {repeat + 1}: {frame_count * 1000 / durations[mode][-1]:.3f} FPS", flush=True)
+            quality = {name: [] for name in durations}
+            for start, size in windows:
+                dataflow, _, _, _ = self.dataflow(times[start:start + size], start)
+                for local, frame in enumerate(range(start, start + size)):
+                    target = Image.open(targets[frame]).convert("RGB")
+                    if target.size != (self.model.width, self.model.height):
+                        if getattr(self.model, "workload", "ex4dgs") in ("explicit4d", "anchored"):
+                            raise ValueError("this workload requires native half-resolution image preprocessing")
+                        target = target.resize((self.model.width, self.model.height), Image.Resampling.BILINEAR)
+                    target = torch.from_numpy(np.asarray(target).copy()).to(self.model.xyz.device, dtype=torch.float32) / 255
+                    baseline = self.baseline(times[frame:frame + 1], frame)
+                    quality["baseline"].append(cuda_image_quality(baseline, target))
+                    quality["dataflow"].append(cuda_image_quality(dataflow[local], target))
+        lines = [f"# {self.model.name}", "", f"Device: {torch.cuda.get_device_name(self.model.xyz.device)}. Resolution: {self.model.width} x {self.model.height}.",
+                 f"Frames: {frame_count}; measured repeats: {repeats}; warmup windows: {warmup}.",
+                 f"Workload: {getattr(self.model, 'workload', 'ex4dgs')}; FP32; background: {'black' if self.model.config.get('background', 1) == 0 else 'white'}.",
+                 f"Raster bounds: {self.model.config['near']} to {self.model.config['far']}; stability bounds: {self.model.config.get('stability_near', self.model.config['near'])} to {self.model.config.get('stability_far', self.model.config['far'])}.",
+                 "Alpha cutoff: 1/255; alpha cap: 0.999; transmittance stop: 1e-4.",
+                 "CUDA events measure end-to-end execution under identical ready-window submission; latency uses actual per-frame completion events.",
+                 "Model and GT loading, warmup, prepass, and quality calculation are outside the measurement interval.",
+                 f"L2: {self.l2_bytes} bytes; maximum estimated batch footprint: {maximum_footprint} bytes; maximum batch count: {maximum_batches}.", "",
+                 "| Path | FPS | P95 ms | P99 ms | PSNR dB | SSIM |", "| --- | ---: | ---: | ---: | ---: | ---: |"]
+        if hasattr(self.model, "iteration"):
+            provenance = f"Checkpoint training step: {self.model.iteration}."
+            if hasattr(self.model, "source_iteration"):
+                provenance += f" Source step: {self.model.source_iteration}; masked fine-tuning updates: {self.model.iteration - self.model.source_iteration}."
+            lines[3:3] = [provenance]
+        if hasattr(self.model, "anchor_count"):
+            lines[4:4] = [f"Anchors: {self.model.anchor_count}; static anchors: {self.model.static_anchor_count}; bound Gaussians: {self.model.anchor_count * 10}."]
+        elif hasattr(self.model, "source_count"):
+            lines[4:4] = [f"Pruned Gaussians: {self.model.source_count}."]
+        for mode in durations:
+            fps = frame_count * repeats * 1000 / sum(durations[mode])
+            p95, p99 = np.quantile(latencies[mode], (0.95, 0.99), method="linear")
+            psnr, ssim = np.mean(quality[mode], axis=0)
+            lines.append(f"| {mode} | {fps:.6f} | {p95:.6f} | {p99:.6f} | {psnr:.6f} | {ssim:.6f} |")
+        speedup = sum(durations["baseline"]) / sum(durations["dataflow"])
+        differences = np.asarray(quality["dataflow"]) - np.asarray(quality["baseline"])
+        mean_difference = differences.mean(0)
+        maximum_difference = np.abs(differences).max(0)
+        lines.extend(("", f"Measured speedup: {speedup:.6f}x.",
+                      f"Scene-level Dataflow - baseline PSNR/SSIM: {mean_difference[0]:+.6f} dB / {mean_difference[1]:+.8f}.",
+                      f"Maximum per-frame absolute PSNR/SSIM changes: {maximum_difference[0]:.6f} dB / {maximum_difference[1]:.8f}.",
+                      "", "| Repeat | Baseline ms | Dataflow ms |", "| ---: | ---: | ---: |"))
+        lines.extend(f"| {index + 1} | {base:.6f} | {flow:.6f} |" for index, (base, flow) in enumerate(zip(durations["baseline"], durations["dataflow"])))
+        lines.extend(("", "## Per-frame samples", "", "| Frame | Baseline PSNR | Dataflow PSNR | Baseline SSIM | Dataflow SSIM |", "| ---: | ---: | ---: | ---: | ---: |"))
+        lines.extend(f"| {index} | {base[0]:.6f} | {flow[0]:.6f} | {base[1]:.6f} | {flow[1]:.6f} |" for index, (base, flow) in enumerate(zip(quality["baseline"], quality["dataflow"])))
+        lines.extend(("", "| Latency sample | Baseline ms | Dataflow ms |", "| ---: | ---: | ---: |"))
+        lines.extend(f"| {index} | {base:.6f} | {flow:.6f} |" for index, (base, flow) in enumerate(zip(latencies["baseline"], latencies["dataflow"])))
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "summary.md").write_text("\n".join(lines) + "\n", encoding="ascii")

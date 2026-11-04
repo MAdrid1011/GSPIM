@@ -1,4 +1,4 @@
-"""Independent S3/S4 helper equations for golden comparisons."""
+"""Independent normalized depth-stability equation."""
 
 from math import exp
 from typing import Sequence

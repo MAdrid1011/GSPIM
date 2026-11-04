@@ -1,41 +1,52 @@
-# Runtime Contract
+# Runtime and synchronization
 
-The functional Python runtime uses typed task descriptors to model dependency,
-cache-visibility, block-completion, and final-completion semantics. The
-Chisel `LpddrTaskAdapter` maps that same public descriptor contract to
-standard LPDDR `WRITE` transactions at reserved control addresses and returns
-final completion through a reserved-address `READ`. Program writes may target
-one bank or broadcast to every PIM bank; layout writes target one bank, so a
-model loader emits the corresponding layout write for each participating bank.
-`PIM_SELECT` names a PPIM program, source region, die, explicit PIM-bank scope,
-and physical block scope; it produces block masks. `PIM_REORG` names a
-source/destination region, compaction purpose, bank and block scopes, and a
-selection dependency; it drives HCF compaction or binding expansion. This is a
-transaction protocol only: it does not model LPDDR timing.
+## Task descriptors
 
-Every descriptor is submitted to the die and PIM banks that own its source
-blocks. A completion includes the task ID, die, destination line/range,
-overflow state, and final count; HCF exposes each completed block range through
-a decoupled transaction separately. S1 and S3 REORG requests identify the
-preceding SELECT completion; the tile snapshots that map and program origin so
-the next SELECT may overwrite its selection storage while HCF drains the prior
-map. Batch REORG instead consumes GPU-provided masks. The Chisel top is one
-die-level tile; cross-die dependencies are represented by the functional trace,
-not by an instantiated multi-die RTL wrapper.
+The Python runtime models task dependencies, cache visibility, block completion,
+and final completion with typed descriptors. `LpddrTaskAdapter` maps descriptors to
+LPDDR `WRITE` transactions at reserved control addresses and reads final completion
+through a reserved-address `READ`.
 
-Before PIM consumes a GPU-written source, the GPU writes it back. Before the
-GPU reads a PIM-written destination, it invalidates the region and acquires the
-task completion. Violations fail deterministically.
+Program writes target one bank or broadcast to all PIM banks. Layout writes target
+one bank. A model loader installs layouts on every participating bank.
+`PIM_SELECT` supplies a program, source region, die, PIM-bank scope, and physical
+block scope to produce masks. `PIM_REORG` supplies source and destination regions,
+a compaction purpose, bank/block scopes, and a selection dependency to invoke HCF
+packing or binding expansion.
 
-S1 -> S2 -> S3 is `(die, bank, block)`-granular. S1 uses the explicit
-`[t_min, t_max)` supplied for that window, and its HCF output assigns a global
-Active Index before S2 begins. The block-local GPU `S3_GPU` task performs
-camera-space depth transformation and SS reduction before the dependent PPIM
-stability SELECT and reorganization. S4 waits for the full window. S5 has two
-batch buffers: pack zero precedes render zero; later packing can overlap the
-preceding render, and each later render waits for both its pack and the prior
-render. The runtime records which render remains live when the later pack
-completes. S3's window decision releases next-window S1 without waiting for the
-current window's S4/S5; the shared runtime records current S5 render as live
-when that next-window S1 completion occurs. No elapsed-time estimate is
-produced.
+Descriptors go to the die and banks owning their source blocks. Completion includes
+task ID, die, destination range, overflow state, and final count. HCF reports each
+completed block range separately through a decoupled transaction.
+
+## Dependencies and buffers
+
+Active and stability reorganization requests identify their preceding selection
+completion. The tile snapshots the masks and originating program while HCF drains
+them, allowing the next selection to reuse selection storage. Batch reorganization
+consumes GPU-generated masks.
+
+The window pipeline has five stages: active selection (S1), geometry generation
+(S2), stability classification (S3), render-order construction (S4), and batched
+composition (S5). S1 through S3 proceed at `(die, bank, block)` granularity.
+S1 uses the explicit half-open window `[t_min, t_max)`; HCF assigns a global active
+index before S2. Block-local `S3_GPU` transforms camera-space depth and reduces
+stability before dependent PPIM classification and packing. S4 waits for the whole
+window.
+
+S5 alternates two batch buffers. The first pack precedes the first render. Later
+packing can overlap the preceding render; each later render waits for its own pack
+and the prior render. The next window's S1 depends on the current S3 window decision
+and can overlap current S4/S5. Functional traces retain the live-task relationships
+at completion events.
+
+## Visibility and completion
+
+Before PIM consumes GPU-written data, the GPU writes back the source region.
+Before the GPU reads PIM-written data, it invalidates the destination region and
+acquires completion. The runtime validates region ownership and completion
+order. Physical block completions permit consumers to start before a multi-block
+task's final completion. Workspace releases follow the consuming task's lifetime.
+
+The CUDA renderer uses stream events to order projection, metadata preparation,
+and composition. Cross-stream tensor lifetimes are recorded on the consuming
+stream. Timing uses frame completion events as described in [running](running.md).

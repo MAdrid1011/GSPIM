@@ -42,9 +42,9 @@ class Explicit4DLayout:
         required = ("primitive_id", "temporal_mean", "temporal_rotation", "temporal_scale", "mean", "opacity", "color", "attribute_bytes", "die", "bank", "block", "slot")
         converted: list[Explicit4DRecord] = []
         for value in records:
-            legacy = {"velocity", "covariance"} & set(value)
-            if legacy:
-                raise ValueError(f"explicit-4D uses conditional 4D slicing, not legacy fields: {', '.join(sorted(legacy))}")
+            unsupported = {"velocity", "covariance"} & set(value)
+            if unsupported:
+                raise ValueError(f"explicit-4D conditional slicing has unsupported fields: {', '.join(sorted(unsupported))}")
             missing = [key for key in required if key not in value]
             if missing:
                 raise ValueError(f"explicit-4D record is missing fields: {', '.join(missing)}")

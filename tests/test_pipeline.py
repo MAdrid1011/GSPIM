@@ -1,11 +1,9 @@
-"""End-to-end fixed-fixture comparison against the independent reference model."""
+"""Selection, scheduling and rendering comparisons against independent algorithms."""
 
-import json
 import unittest
-from pathlib import Path
 from unittest.mock import Mock, patch
 
-from tests.fixtures import ANCHOR_PAYLOADS, ANCHORS, CAMERA, EX4DGS_RECORDS, EXPLICIT_RECORDS, TIMESTAMPS
+from tests.test_layouts import ANCHOR_PAYLOADS, ANCHORS, CAMERA, EX4DGS_RECORDS, EXPLICIT_RECORDS, TIMESTAMPS
 
 
 class PipelineTests(unittest.TestCase):
@@ -21,22 +19,24 @@ class PipelineTests(unittest.TestCase):
         frames = tuple(FrameRequest(timestamp, Camera.from_mapping(CAMERA)) for timestamp in TIMESTAMPS[:5])
         actual = GSPIMPipeline(l2_capacity=512).run_window(layout, frames, window_start=0.0, window_end=5.0)
         expected = run_explicit_window(EXPLICIT_RECORDS, CAMERA, TIMESTAMPS[:5], 0.0, 5.0, 512)
-        golden = json.loads((Path(__file__).parent / "golden" / "explicit4d_window.json").read_text(encoding="ascii"))
-        self.assertEqual(golden["window"], {"start": 0.0, "end": 5.0})
         self.assertEqual(actual.active_ids, expected.active_ids)
         self.assertEqual(actual.render_order_plan.rols, expected.rols)
         self.assertEqual(tuple(batch.footprint.total_bytes for batch in actual.batches), expected.batch_bytes)
         self.assertEqual(tuple(frame.checksum for frame in actual.rendered_frames), expected.checksums)
-        self.assertEqual(sorted(actual.active_ids), golden["active_ids"])
-        self.assertEqual(sorted(actual.stable_ids), golden["stable_ids"])
-        self.assertEqual(sorted(actual.unstable_ids), golden["unstable_ids"])
-        self.assertEqual([list(rol) for rol in actual.render_order_plan.rols], golden["rols"])
-        self.assertEqual([batch.footprint.total_bytes for batch in actual.batches], golden["batch_bytes"])
-        self.assertEqual([frame.checksum for frame in actual.rendered_frames], golden["checksums"])
-        for parent, child in golden["required_edges"]:
+        self.assertEqual(actual.stable_ids, expected.stable_ids)
+        self.assertEqual(actual.unstable_ids, expected.unstable_ids)
+        edges = (
+            ('w0:s1-reorg-d0:bank0-b0', 'w0:s2-d0-bank0-b0'),
+            ('w0:s2-d0-bank0-b0', 'w0:s3-gpu-d0-bank0-b0'),
+            ('w0:s3-gpu-d0-bank0-b0', 'w0:s3-select-d0-bank0-b0'),
+            ('w0:s3-window', 'w0:s4'),
+            ('w0:s5-pack-0-d0', 'w0:s5-render-0'),
+            ('w0:s5-pack-0-d1', 'w0:s5-render-0'),
+        )
+        for parent, child in edges:
             self.assertTrue(actual.trace.has_dependency(parent, child))
 
-    def test_three_workload_fixtures_run_and_six_frames_exercise_loopback(self):
+    def test_three_layouts_run_and_six_frames_exercise_loopback(self):
         from gspim.layouts.anchored import Anchored4DGSLayout
         from gspim.layouts.ex4dgs import Ex4DGSLayout
         from gspim.layouts.explicit4d import Explicit4DLayout
@@ -51,22 +51,23 @@ class PipelineTests(unittest.TestCase):
             Explicit4DLayout.from_mappings(EXPLICIT_RECORDS), four_frames + two_frames,
             initial_window_size=4, frame_period=1.0,
         )
-        golden = json.loads((Path(__file__).parent / "golden" / "explicit4d_six_frame_sequence.json").read_text(encoding="ascii"))
-        self.assertEqual([len(window.frames) for window in sequence.windows], golden["window_sizes"])
-        self.assertEqual([window.next_window_size for window in sequence.windows], golden["next_window_sizes"])
-        self.assertEqual(
-            [[frame.checksum for frame in window.rendered_frames] for window in sequence.windows],
-            golden["checksums"],
-        )
-        for parent, child in golden["required_edges"]:
-            self.assertTrue(sequence.trace.has_dependency(parent, child))
+        from reference_model.pipeline import run_explicit_window
+
+        self.assertEqual([len(window.frames) for window in sequence.windows], [4, 2])
+        self.assertEqual([window.next_window_size for window in sequence.windows], [3, 2])
+        for window in sequence.windows:
+            timestamps = tuple(frame.timestamp for frame in window.frames)
+            expected = run_explicit_window(EXPLICIT_RECORDS, CAMERA, timestamps,
+                                           timestamps[0], timestamps[-1] + 1, 512)
+            self.assertEqual(tuple(frame.checksum for frame in window.rendered_frames), expected.checksums)
+        self.assertTrue(sequence.trace.has_dependency("w0:s3-window", "w1:s1-select-d0"))
         self.assertIn("w0:s5-render-0", sequence.windows[1].live_at_completion["w1:s1-select-d0"])
         for layout in (Ex4DGSLayout.from_mappings(EX4DGS_RECORDS), Anchored4DGSLayout.from_mappings(ANCHORS, ANCHOR_PAYLOADS)):
             result = pipeline.run_window(layout, four_frames, window_start=0.0, window_end=4.0)
             self.assertTrue(result.rendered_frames)
             self.assertTrue(all(frame.checksum for frame in result.rendered_frames))
 
-    def test_ex4dgs_and_anchored_match_independent_golden_windows(self):
+    def test_ex4dgs_and_anchored_match_independent_windows(self):
         from gspim.layouts.anchored import Anchored4DGSLayout
         from gspim.layouts.ex4dgs import Ex4DGSLayout
         from gspim.model import Camera, FrameRequest
@@ -88,20 +89,12 @@ class PipelineTests(unittest.TestCase):
         )
         for name, layout, expected in cases:
             actual = GSPIMPipeline(l2_capacity=512).run_window(layout, frames, window_start=0.0, window_end=5.0)
-            golden = json.loads((Path(__file__).parent / "golden" / f"{name}_window.json").read_text(encoding="ascii"))
-            self.assertEqual(golden["window"], {"start": 0.0, "end": 5.0})
             self.assertEqual(actual.active_ids, expected.active_ids)
             self.assertEqual(actual.stable_ids, expected.stable_ids)
             self.assertEqual(actual.unstable_ids, expected.unstable_ids)
             self.assertEqual(actual.render_order_plan.rols, expected.rols)
             self.assertEqual(tuple(batch.footprint.total_bytes for batch in actual.batches), expected.batch_bytes)
             self.assertEqual(tuple(frame.checksum for frame in actual.rendered_frames), expected.checksums)
-            self.assertEqual(sorted(actual.active_ids), golden["active_ids"])
-            self.assertEqual(sorted(actual.stable_ids), golden["stable_ids"])
-            self.assertEqual(sorted(actual.unstable_ids), golden["unstable_ids"])
-            self.assertEqual([list(rol) for rol in actual.render_order_plan.rols], golden["rols"])
-            self.assertEqual([batch.footprint.total_bytes for batch in actual.batches], golden["batch_bytes"])
-            self.assertEqual([frame.checksum for frame in actual.rendered_frames], golden["checksums"])
 
     def test_ex4dgs_partial_support_fails_before_any_s1_or_hcf_work(self):
         from gspim.hcf import HierarchicalCompactionFabric

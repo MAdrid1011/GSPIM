@@ -7,9 +7,8 @@ import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 
 class GeneratedRtlSpec extends AnyFlatSpec with ChiselScalatestTester with Matchers {
-  // The Verilator integration fixture keeps all program, task, FIFO, gather,
-  // binding, and multi-bank/block states while reducing only replication. The
-  // `Generate` target below still emits the default paper-context topology.
+  // Exercise program loading, tasks, FIFO gathering, binding expansion, and
+  // multiple banks and blocks in the generated RTL.
   private val p = GspimParams(
     packages = 1,
     diesPerPackage = 2,
@@ -224,8 +223,8 @@ class GeneratedRtlSpec extends AnyFlatSpec with ChiselScalatestTester with Match
       dut.io.hcfBindingSourceAddress(0).expect(900.U)
       dut.io.hcfBindingSourceAddress(1).expect(901.U)
       finishTask(dut)
-      // The reduced integration fixture has an eight-entry workspace. Model
-      // S2 consuming the two-entry Active Buffer before the next S1 task.
+      // Release the two-entry Active Buffer after S2 consumes it, making space
+      // in the eight-entry workspace for the next S1 task.
       releaseRange(dut, 0, 2)
 
       setField(dut, 0, 0, 0, defaultLayout(PpimLayoutField.score), 65536)
@@ -294,7 +293,7 @@ class GeneratedRtlSpec extends AnyFlatSpec with ChiselScalatestTester with Match
 
       // Program slot and representation kind are independent model-load
       // metadata. An anchor program in slot three must still trigger indirect
-      // binding expansion even though slot three was originally depth-stable.
+      // binding expansion after replacing the depth-stability program.
       load(dut, 3, 0, PpimMicroOp.load, PpimProgramId.anchorOverlap.litValue.toInt)
       load(dut, 3, 1, PpimMicroOp.compareLt, PpimProgramId.anchorOverlap.litValue.toInt)
       load(dut, 3, 2, PpimMicroOp.compareLt, PpimProgramId.anchorOverlap.litValue.toInt)

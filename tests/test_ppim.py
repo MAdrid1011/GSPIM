@@ -3,7 +3,7 @@
 import math
 import unittest
 
-from tests.fixtures import EXPLICIT_RECORDS
+from tests.test_layouts import EXPLICIT_RECORDS
 
 
 class PpimTests(unittest.TestCase):

@@ -4,10 +4,7 @@ import chisel3._
 import chisel3.util._
 
 /**
-  * Transaction-level bridge for the paper's standard WRITE/READ task protocol.
-  *
-  * This module decodes only the reserved control addresses. It deliberately does
-  * not model LPDDR timing, scheduling, cache hierarchy, or electrical behavior.
+  * Decodes task and model-load transactions at reserved LPDDR WRITE/READ addresses.
   */
 class LpddrTaskAdapter(p: GspimParams) extends Module {
   val io = IO(new Bundle {

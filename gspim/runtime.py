@@ -71,7 +71,6 @@ class Runtime:
         self._tasks: dict[str, PIMTaskDescriptor] = {}
         self._events: dict[str, CompletionEvent] = {}
         self._live_at_completion: dict[str, tuple[str, ...]] = {}
-        self._die_order: dict[int, list[str]] = {die: [] for die in range(dies)}
         self.trace = TaskTrace()
 
     def gpu_write(self, region: MemoryRegion) -> None:
@@ -106,13 +105,11 @@ class Runtime:
             raise VisibilityError(f"writeback required before {descriptor.kind.value} reads {descriptor.source.name}")
         if any(dependency not in self._events for dependency in descriptor.depends_on):
             raise ValueError("all task dependencies must be submitted first")
-        # Command ordering is represented by the descriptor's explicit data
-        # dependency.  A hidden die-wide predecessor would reintroduce the
-        # window barrier that hybrid block scheduling is intended to remove.
+        # Explicit dependencies order commands while allowing independent
+        # physical blocks to make progress on the same die.
         dependencies = tuple(dict.fromkeys(descriptor.depends_on))
         self._tasks[descriptor.task_id] = descriptor
         self._events[descriptor.task_id] = CompletionEvent(descriptor.task_id, descriptor.die, False)
-        self._die_order[descriptor.die].append(descriptor.task_id)
         self.trace.add(descriptor.task_id, descriptor.kind.value, dependencies)
         return self._events[descriptor.task_id]
 
@@ -166,8 +163,8 @@ class Runtime:
         """Expose one HCF-produced physical block before its die task finishes.
 
         The host-visible PIM_REORG command retains its final completion and
-        aggregate count.  This event is the paper's earlier block-range
-        notification that releases the dependent GPU S2/S3 work.
+        aggregate count. Each block-range notification releases its dependent
+        GPU S2/S3 work.
         """
 
         if task_id not in self._tasks:
@@ -207,13 +204,13 @@ class Runtime:
 
     @property
     def events(self) -> Mapping[str, CompletionEvent]:
-        """Immutable-view completion evidence exposed by a completed window."""
+        """Return a snapshot of task completion metadata."""
 
         return dict(self._events)
 
     @property
     def live_at_completion(self) -> Mapping[str, tuple[str, ...]]:
-        """Tasks live when each completion was emitted; used to prove overlap."""
+        """Tasks that were live when each completion was emitted."""
 
         return dict(self._live_at_completion)
 

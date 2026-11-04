@@ -1,1 +1,1 @@
-"""Optional third-party workload integration metadata and converters."""
+"""Workload registry and Gaussian checkpoint loaders."""

@@ -5,20 +5,23 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "gspim-reference"
 version = "0.1.0"
-description = "Functional and RTL mechanism reference for GSPIM"
+description = "GSPIM CUDA dataflow and PPIM/HCF design models"
 requires-python = ">=3.10"
 license = {file = "LICENSE"}
 dependencies = []
 
 [project.optional-dependencies]
 test = ["pytest>=8"]
-
-[project.scripts]
-gspim-demo = "gspim.demo:main"
+cuda = ["torch==2.5.0", "gsplat==1.5.3", "plyfile>=1.1", "Pillow==12.1.1", "numpy==2.0.1", "ninja>=1.11"]
+training = ["scipy>=1.14", "PyYAML>=6", "fused-ssim @ git+https://github.com/rahul-goel/fused-ssim.git@a7c48d6dd7ac6dc39a7958c7c4452e0b10418f38"]
 
 [tool.setuptools]
-packages = ["gspim", "gspim.layouts", "reference_model", "integrations"]
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+packages = ["gspim", "gspim.layouts", "gspim.training", "reference_model", "integrations"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+
+[tool.setuptools.package-data]
+gspim = ["renderer.cu"]

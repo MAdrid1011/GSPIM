@@ -108,8 +108,8 @@ class HcfGatherWriter(p: GspimParams) extends Module {
     val outputCount = Output(UInt(countWidth.W))
     val packedPayload = Output(Vec(outputRecords, UInt(32.W)))
     val packedValid = Output(Vec(outputRecords, Bool()))
-    // Anchor payloads are returned by the memory-side binding-table read at
-    // these generated addresses; they are not host-injected defaults.
+    // These generated addresses select anchor payloads from the memory-side
+    // binding table.
     val bindingSourceAddress = Output(Vec(outputRecords, UInt(32.W)))
     val bindingSourceAddressValid = Output(Vec(outputRecords, Bool()))
     val blockComplete = Output(Bool())
@@ -180,10 +180,8 @@ class HcfGatherWriter(p: GspimParams) extends Module {
   val taskOutputCount = RegInit(0.U(16.W))
   val taskOverflow = RegInit(false.B)
 
-  // Python HCF reserves the largest available contiguous interval and compacts
-  // its prefix.  The remaining selected records take the explicit GPU fallback.
-  // Matching that rule here keeps both public execution models transactionally
-  // equivalent when a task is larger than the current live-range hole.
+  // Reserve the largest available contiguous interval for the compacted prefix.
+  // Selected records beyond that interval take the GPU fallback.
   var firstFit: UInt = 0.U(16.W)
   var largestFree: UInt = 0.U(16.W)
   for (candidateStart <- 0 until capacity) {
