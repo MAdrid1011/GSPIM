@@ -378,6 +378,201 @@ def train_anchored(scene="sear_steak", until=ANCHORED_TRAINING_STEPS):
     return checkpoint
 
 
+def _source_training_views(scene):
+    """Load synchronized training views while keeping the held-out camera separate."""
+    import json
+    from integrations.explicit4d import n3v_cameras
+
+    dataset = ROOT / "datasets/n3v" / scene
+    if (dataset / "transforms_train.json").is_file():
+        training = json.loads((dataset / "transforms_train.json").read_text())["frames"]
+        heldout = json.loads((dataset / "transforms_test.json").read_text())
+        return dataset, training, heldout, "transforms_train.json"
+
+    poses, width, height, focal = n3v_cameras(dataset / "poses_bounds.npy")
+    videos = sorted(dataset.glob("cam[0-9][0-9].mp4"))
+    if len(videos) != len(poses) or videos[0].stem != "cam00":
+        raise ValueError("camera video IDs must match the supplied poses")
+    training, test = [], []
+    for pose, video in zip(poses, videos):
+        matrix = pose.copy()
+        matrix[:3, 1:3] *= -1
+        for path in sorted((dataset / "images").glob(f"{video.stem}_*.png")):
+            index = int(path.stem.rsplit("_", 1)[1])
+            frame = dict(file_path=str(path.relative_to(dataset).with_suffix("")),
+                         time=index / 30, transform_matrix=matrix.tolist(),
+                         fl_x=focal, fl_y=focal, cx=width / 2, cy=height / 2)
+            (test if video.stem == "cam00" else training).append(frame)
+    if not training or not test:
+        raise ValueError("training and held-out images are required")
+    return dataset, training, dict(frames=test, w=width, h=height), "images/cam01.."
+
+
+def _source_calibration(frame):
+    pose = np.asarray(frame["transform_matrix"]).copy()
+    pose[:3, 1:3] *= -1
+    intrinsic = [[[frame["fl_x"], 0, frame["cx"]],
+                  [0, frame["fl_y"], frame["cy"]], [0, 0, 1]]]
+    return (torch.tensor(pose, dtype=torch.float32, device="cuda"),
+            torch.tensor(intrinsic, dtype=torch.float32, device="cuda"))
+
+
+def _render_shared_views(model, timestamp, poses, intrinsics, width, height):
+    from gsplat import rasterization
+
+    values = model.slice(timestamp, poses[0, :3, 3])
+    colors = [values["colors"]]
+    for pose in poses[1:]:
+        direction = torch.nn.functional.normalize(model.anchors[:, :3]-pose[:3, 3], dim=-1)
+        decoded = model.color_mlp(torch.cat((model.features, direction), -1)).view(-1, 3)
+        colors.append(decoded[values["ids"]])
+    rendered, _, _ = rasterization(
+        values["means"], None, None, values["opacities"], torch.stack(colors),
+        torch.linalg.inv(poses), intrinsics, width, height, near_plane=.2,
+        eps2d=.3, packed=False, covars=values["covars"])
+    return rendered, values["volume"]
+
+
+def train_anchored_from_source(scene="sear_steak", source=None, until=None):
+    """Fit the supplied Anchored model from a calibrated explicit 4D source."""
+    from concurrent.futures import ThreadPoolExecutor
+    import hashlib
+    from pathlib import Path
+    import time
+    from fused_ssim import fused_ssim
+    from integrations.manifest import WORKLOADS
+
+    parameters = WORKLOADS["anchored"].parameters_for(scene)
+    until = parameters["training_steps"] if until is None else until
+    if not 1 <= until <= parameters["training_steps"]:
+        raise ValueError("training exceeds the supplied model's recorded update budget")
+    source = (ROOT / "checkpoints/training/4dgs" / f"{scene}-trained.pth"
+              if source is None else Path(source))
+    if not source.is_absolute():
+        source = ROOT / source
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    torch.set_num_threads(4)
+    torch.manual_seed(0)
+    fields, source_iteration = torch.load(
+        source, map_location="cpu", weights_only=False, mmap=True)[:2]
+    if source_iteration != parameters["source_iteration"]:
+        raise ValueError("source checkpoint iteration does not match the workload manifest")
+
+    points = fields[1].detach()
+    grouping = points
+    lower, upper = grouping.amin(0), grouping.amax(0)
+    voxel = ((grouping-lower)/(upper-lower).clamp_min(1e-6)*1023).long()
+    morton = torch.zeros(len(points), dtype=torch.int64)
+    for bit in range(10):
+        for axis in range(3):
+            morton |= ((voxel[:, axis] >> bit) & 1) << (3*bit+axis)
+    count = len(points)//10
+    ids = morton.argsort(stable=True)[:count*10].reshape(count, 10)
+    means = torch.cat((points, fields[13].detach()), -1)[ids].cuda()
+    anchors = means.mean(1).contiguous()
+    model = AnchoredModel(anchors, fields[4][ids].detach().exp().mean((1, 2)).cuda())
+
+    with torch.no_grad():
+        model.offsets.copy_(means-anchors[:, None])
+        model.log_scales.copy_(torch.cat((fields[4][ids], fields[14][ids]), -1).cuda()+np.log(2))
+        opacity = fields[6][ids].sigmoid().clamp(1e-5, 1-1e-5).cuda()
+        color = (fields[2][ids, 0]*.28209479177387814+.5).clamp(1e-4, 1-1e-4).reshape(count, 30).cuda()
+        left = torch.nn.functional.normalize(
+            fields[5][ids].cuda()*anchors.new_tensor([1, -1, 1, -1]), dim=-1)
+        right = torch.nn.functional.normalize(
+            fields[15][ids].cuda()*anchors.new_tensor([1, -1, 1, 1]), dim=-1)
+        covariance = torch.cat((torch.zeros_like(left), left, right), -1).reshape(count, 120)
+        desired = torch.cat((opacity.atanh().reshape(count, 10), covariance, color.logit()), -1)
+        center = desired.mean(0)
+        centered = desired-center
+        _, _, basis = torch.pca_lowrank(centered, q=32, center=False, niter=3)
+        features = centered@basis
+        shift = (-features.amin(0)).clamp_min(0)+1
+        model.features.copy_(features+shift)
+        reconstruction = center-shift@basis.T
+        for decoder, lo, hi in ((model.opacity_mlp, 0, 10),
+                                (model.covariance_mlp, 10, 130),
+                                (model.color_mlp, 130, 160)):
+            decoder[0].weight.zero_()
+            decoder[0].bias.zero_()
+            decoder[0].weight[:, :32].copy_(torch.eye(32, device="cuda"))
+            decoder[2].weight.copy_(basis[lo:hi])
+            decoder[2].bias.copy_(reconstruction[lo:hi])
+
+    dataset, frames, heldout, view_source = _source_training_views(scene)
+    by_time = {}
+    for index, frame in enumerate(frames):
+        by_time.setdefault(round(frame["time"]*30), []).append(index)
+    width, height = heldout["w"], heldout["h"]
+    centers = np.stack([np.asarray(frame["transform_matrix"])[:3, 3] for frame in frames])
+    extent = float(np.linalg.norm(centers-centers.mean(0), axis=-1).max()*1.1)
+    optimizer = torch.optim.Adam(model.optimizer(extent).param_groups, eps=1e-15, fused=True)
+    rates = dict(offsets=.00016*extent, features=.0025, log_scales=.005,
+                 opacity_mlp=.0001, covariance_mlp=.0001, color_mlp=.0001)
+    for group in optimizer.param_groups:
+        group["lr"] = rates[group["name"]]
+
+    rng = np.random.default_rng(0)
+
+    def read(index):
+        frame = frames[index]
+        with Image.open(dataset / (frame["file_path"]+".png")) as image:
+            pixels = np.array(image.convert("RGB"))
+        return frame, _source_calibration(frame), pixels
+
+    started = time.monotonic()
+    with ThreadPoolExecutor(max_workers=2) as loader:
+        pending = None
+        for iteration in range(1, until+1):
+            if pending is None:
+                first = int(rng.integers(0, len(frames)))
+                peers = [value for value in by_time[round(frames[first]["time"]*30)] if value != first]
+                batch = [first, int(rng.choice(peers))]
+                pending = [loader.submit(read, index) for index in batch]
+            samples = [future.result() for future in pending]
+            first = int(rng.integers(0, len(frames)))
+            peers = [value for value in by_time[round(frames[first]["time"]*30)] if value != first]
+            pending = [loader.submit(read, index) for index in (first, int(rng.choice(peers)))]
+            poses = torch.stack([camera[0] for _, camera, _ in samples])
+            intrinsics = torch.cat([camera[1] for _, camera, _ in samples])
+            target = torch.from_numpy(np.stack([pixels for _, _, pixels in samples])).cuda().float()/255
+            optimizer.zero_grad(set_to_none=True)
+            rendered, volume = _render_shared_views(
+                model, samples[0][0]["time"], poses, intrinsics, width, height)
+            similarity = fused_ssim(rendered.permute(0, 3, 1, 2).contiguous(),
+                                    target.permute(0, 3, 1, 2).contiguous())
+            loss = .8*(rendered-target).abs().mean()+.2*(1-similarity)+.001*volume
+            loss.backward()
+            optimizer.step()
+            if iteration % 100 == 0 or iteration == until:
+                psnr = -10*(rendered.detach().clamp(0, 1)-target).square().mean().log10()
+                print("Anchored source step", iteration, "loss", round(float(loss), 6),
+                      "training PSNR", round(float(psnr), 4), flush=True)
+
+    excluded = {"opacity_sum", "visits", "gradient_sum", "gradient_count"}
+    state = {name: value.detach().cpu().contiguous()
+             for name, value in model.state_dict().items() if name not in excluded}
+    first = heldout["frames"][0]
+    pose, _ = _source_calibration(first)
+    checkpoint = TRAINING / "anchored4dgs" / f"{scene}.pth"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    payload = dict(method="anchored4dgs-paper-reconstruction", iteration=until,
+        training_steps=until, choices=dict(model.choices), model=state,
+        intervals=model.intervals().cpu(), inference_only=True,
+        source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+        source_iteration=source_iteration, training_views=view_source,
+        training_batch_size=2, grouping_dimensions=3, shared_geometry=True,
+        training_seconds=time.monotonic()-started,
+        camera=dict(camera_to_world=pose.cpu().tolist(), width=width, height=height,
+                    fx=first["fl_x"], fy=first["fl_y"], cx=first["cx"], cy=first["cy"]),
+        frame_count=len(heldout["frames"]))
+    temporary = checkpoint.with_suffix(".pth.part")
+    torch.save(payload, temporary)
+    temporary.replace(checkpoint)
+    return checkpoint
+
+
 
 def export_checkpoint(source, destination):
     """Export trained anchor fields, decoders and conservative intervals."""

@@ -89,15 +89,28 @@ class Explicit4DCheckpoint:
         self.temporal_means = fields[13].to(device).flatten()
         self.opacity = fields[6].to(device).sigmoid().flatten()
         self.masks = masks.to(device)
-        poses, self.width, self.height, focal = n3v_cameras(images.parent / "poses_bounds.npy")
-        c2w = torch.tensor(poses[0], dtype=torch.float32, device=device)
-        self.view = torch.tensor(np.linalg.inv(poses[0]), dtype=torch.float32,
+        camera = metadata.get("camera")
+        if camera is None:
+            poses, self.width, self.height, focal = n3v_cameras(images.parent / "poses_bounds.npy")
+            pose, fx, fy = poses[0], focal, focal
+            cx, cy = self.width / 2, self.height / 2
+        else:
+            pose = np.asarray(camera["camera_to_world"], dtype=np.float64)
+            self.width, self.height = int(camera["width"]), int(camera["height"])
+            fx, fy, cx, cy = (float(camera[key]) for key in ("fx", "fy", "cx", "cy"))
+            if (pose.shape != (4, 4) or not np.isfinite(pose).all() or
+                    self.width < 1 or self.height < 1 or min(fx, fy) <= 0 or
+                    not np.isfinite([fx, fy, cx, cy]).all()):
+                raise ValueError("invalid checkpoint camera calibration")
+        c2w = torch.tensor(pose, dtype=torch.float32, device=device)
+        self.view = torch.tensor(np.linalg.inv(pose), dtype=torch.float32,
                                  device=device)[None].contiguous()
         self.camera_position = c2w[:3, 3].contiguous()
-        self.intrinsics = torch.tensor([[[focal, 0, self.width/2],
-                                          [0, focal, self.height/2], [0, 0, 1]]],
+        self.intrinsics = torch.tensor([[[fx, 0, cx], [0, fy, cy], [0, 0, 1]]],
                                        device=device, dtype=torch.float32)
-        self.name, self.duration = path.stem, 300
+        self.name, self.duration = path.stem, int(metadata.get("frame_count", 300))
+        if not 2 <= self.duration <= 300:
+            raise ValueError("checkpoint frame count must lie in 2..300")
         self.workload, self.image_prefix = "explicit4d", "cam00_"
         self.config = {"kernel_size": .3, "near": .2, "far": float("inf"), "background": 0,
                        "stability_near": .01, "stability_far": 100.0}
@@ -107,7 +120,7 @@ class Explicit4DCheckpoint:
     def select(self, times, first=None):
         if first is None:
             first = int(times[0].item())
-        if first < 0 or first+len(times) > 300 or not 1 <= len(times) <= 5:
+        if first < 0 or first+len(times) > self.duration or not 1 <= len(times) <= 5:
             raise ValueError("1K window must contain one to five in-range N3V frames")
         left, right = first//20, (first+len(times)-1)//20
         # Keep mask filtering, prefix/select and attribute gathering inside

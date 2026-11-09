@@ -3,9 +3,10 @@
 ## Representations and scenes
 
 The workload manifest is [`integrations/manifest.py`](../integrations/manifest.py).
-It defines all twelve combinations, their default paths, public sources, SHA256
+It defines all eighteen combinations, their default paths, public sources, SHA256
 values, upstream revisions, and model parameters. Scene names are
-`coffee_martini`, `cook_spinach`, `flame_steak`, and `sear_steak`.
+`coffee_martini`, `cook_spinach`, `flame_steak`, `sear_steak`, `dance3`, and
+`actor1_4`.
 
 | Workload identifier | Representation | Checkpoint path |
 | --- | --- | --- |
@@ -17,11 +18,25 @@ Ex4DGS v0.1 archives are downloaded from the
 [upstream release](https://github.com/juno181/Ex4DGS/releases/tag/v0.1).
 They contain PLY fields, configuration, and cameras. The adapter evaluates the
 archive directly, using cubic position interpolation and quaternion slerp. The
-archives record 40000 training iterations, 300 frames, keyframe interval ten,
+four Neural 3D Video archives record 40000 training iterations, 300 frames,
+keyframe interval ten,
 time padding two, variance padding three, resolution divisor two, SH degree
-three, clipping bounds four to 300, and projection kernel size 0.1. Place the supplied compact 1K and Anchored models at the paths
-above; their public download URLs are unset in the manifest. `--prepare` verifies
-available models and lists missing ones.
+three, clipping bounds four to 300, and projection kernel size 0.1. Place the
+supplied compact 1K and Anchored models at the paths above; their public download
+URLs are unset in the manifest. `--prepare` verifies available models and lists
+missing ones.
+
+Dance3 and Actor1_4 use the official Mobile-Stage and ENeRF-Outdoor camera
+packages. Their access-controlled source packages are converted to the same
+`poses_bounds.npy`, `images/`, and `cam00/` layout before being placed under
+`datasets/n3v/<scene>/`.
+
+The supplied Dance3 and Actor1_4 models are constructed from native 4D sources
+trained on their calibrated training cameras. Their Ex4DGS keyframe models use
+2837 and 2720 fitting updates, resolution divisor one, near/far planes 0.2/300,
+and a black background. Dance3 covers 300 frames and Actor1_4 covers 200. The manifest's
+`parameters_for(scene)` combines each representation's parameters with the
+values recorded in the selected scene checkpoint.
 
 ## Explicit4D checkpoint and construction
 
@@ -57,6 +72,8 @@ inference files. The retained models use these source and final training steps:
 | cook_spinach | 21000 | 22500 |
 | flame_steak | 6000 | 7500 |
 | sear_steak | 16500 | 19500 |
+| dance3 | 8537 | 10507 |
+| actor1_4 | 7495 | 10760 |
 
 The Sear source includes continued original 4DGS training before pruning. Masked
 fine-tuning uses batches of four, the original learning-rate schedules, frozen
@@ -80,14 +97,17 @@ The loader checks tensor dimensions, finite values, decoder conventions, and the
 recorded training budget.
 
 `gspim.training.anchored` contains `AnchoredModel`, `anchored_inputs(scene)`,
-`train_anchored(scene, until=2000)`, and `export_checkpoint(source, destination)`.
-Initialization uses the Ex4DGS archive's COLMAP point cloud in its original
-coordinate frame. Anchors are quantized at 0.001 spatial and 0.033 temporal units;
-initial temporal scale is 1.414. Training uses batches of two, 0.8 L1 plus 0.2 SSIM
-and a 0.001 volume penalty. Growth uses spatial levels 16/4/1 with 4D centers,
-velocity-aware selection, and accumulated visibility/opacity statistics. The
-static classification begins at step 1500. Each supplied model records 2000
-updates and its decoder choices.
+`train_anchored(scene, until=2000)`,
+`train_anchored_from_source(scene, source, until=None)`, and
+`export_checkpoint(source, destination)`.
+The supplied models initialize binding positions, scales, color features, and
+paired rotations from the matching compact explicit 4D source. Ten spatially
+adjacent primitives form each anchor. Training uses synchronized two-camera
+batches, shared time-conditioned geometry, a 0.8 L1 plus 0.2 SSIM image loss,
+and a 0.001 volume penalty. Decoder inputs and outputs are initialized from a
+32-dimensional low-rank fit of the bound source fields before image training.
+The manifest records the source iteration and completed image-training updates
+for every scene.
 
 Training checkpoints live in `checkpoints/training/anchored4dgs/`; exports retain
 anchor parameters, decoder weights, static flags, and conservative time intervals

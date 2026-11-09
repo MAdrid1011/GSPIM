@@ -17,6 +17,7 @@ dist/
 /checkpoints/
 /third_party/
 /outputs/
+/traces/
 
 # Chisel build products, generated RTL and waveforms
 /hardware/generated/

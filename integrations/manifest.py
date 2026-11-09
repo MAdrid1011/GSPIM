@@ -5,7 +5,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CACHE = Path.home() / ".cache/gspim"
-SCENES = ("coffee_martini", "cook_spinach", "flame_steak", "sear_steak")
+SCENES = (
+    "coffee_martini", "cook_spinach", "sear_steak", "flame_steak",
+    "dance3", "actor1_4",
+)
+SCENE_FRAMES = {
+    "coffee_martini": 300, "cook_spinach": 300, "flame_steak": 300,
+    "sear_steak": 300, "dance3": 300, "actor1_4": 200,
+}
 FRAMES = 300
 
 
@@ -23,9 +30,30 @@ ORIGINAL4DGS = Upstream("4d-gaussian-splatting",
     "121e360ce23d6e9ca7734072393414c844dfaea2")
 FUSED_SSIM = Upstream("fused-ssim", "https://github.com/rahul-goel/fused-ssim.git",
                      "a7c48d6dd7ac6dc39a7958c7c4452e0b10418f38")
-UPSTREAMS = (EX4DGS, ORIGINAL4DGS, FUSED_SSIM)
+RAMULATOR = Upstream("ramulator2", "https://github.com/CMU-SAFARI/ramulator2.git",
+                    "1bb52ceed30cc607a2d328589815eaea976c0224")
+GOLDEN_RATIO = Upstream("Golden-Ratio", "https://github.com/MAdrid1011/Golden-Ratio.git",
+                       "437fd7008436e912a035bc6484e2d181c88d840b")
+UPSTREAMS = (EX4DGS, ORIGINAL4DGS, FUSED_SSIM, RAMULATOR, GOLDEN_RATIO)
 DATA_URL = "https://github.com/facebookresearch/Neural_3D_Video/releases/download/v1.0/{scene}.zip"
 EX4DGS_URL = "https://github.com/juno181/Ex4DGS/releases/download/v0.1/{scene}.zip"
+
+# Official Mobile-Stage and ENeRF-Outdoor camera/video packages use local inputs.
+# Original archive digests identify the supplied camera/video packages.
+OFFICIAL_SCENE_SOURCES = {
+    "dance3": {
+        "name": "Mobile-Stage",
+        "url": "https://docs.google.com/forms/d/e/1FAIpQLSeEbjuTV7w0lfryl-9FPX1VteuPGkbqjDvxXebY02Tm6BMejQ/viewform?usp=sf_link",
+        "archive_sha256": "225886d2b56db95b94496081ce82fd096ccf06a4559469f91858c9838548904a",
+        "scene_archive_sha256": "22e86a75852b47cca36bd7405675905088f8064a19220c9eddeede7dfc0641ad",
+    },
+    "actor1_4": {
+        "name": "ENeRF-Outdoor",
+        "url": "https://docs.google.com/forms/d/e/1FAIpQLSeFAgcnJEDYEaco4vA2QsD-bM8V8CRFuiR0QWbi_3uXmXtUKg/viewform?usp=sf_link",
+        "archive_sha256": "409a335cea24c138c8a9c3fdd96b17f93406a91e9658c39d4a47668893a9336a",
+        "scene_archive_sha256": "c42ff87612735847a91061267df356f3ad6d45bab2ec4025db5c9e5cf7ff3a61",
+    },
+}
 
 # SHA256 of the supplied inference files and original dataset members.
 MODEL_SHA256 = {'ex4dgs': {'coffee_martini': '976901bab79b6b2e56013ce847b45951cd6b14c30204f101e91b6613a54b9e95',
@@ -36,10 +64,10 @@ MODEL_SHA256 = {'ex4dgs': {'coffee_martini': '976901bab79b6b2e56013ce847b45951cd
             'cook_spinach': '8be8cba5e8e2fdd7f8fc37b11788f8a2768c8f07e660b9532bff2b7d7dcc2ea8',
             'flame_steak': '332b718a2302f4828a01b1284f6ae2c89d2d80efd7d602f9aa0ced21bcd17e36',
             'sear_steak': 'd8597e8308c1557e5a4766efc2d42a153bf31bbbdfb6f5aec1e41ca588f9b511'},
- 'anchored4dgs': {'coffee_martini': '854f3c45802de96101cf1bf1bea9ecc2ad4a3728acf43af46c8809bf6623865b',
-                  'cook_spinach': '5ae3c08e78947394cefa03c7549468feefca1d1f6d472a3604c0846d3a02d8b9',
-                  'flame_steak': '45b94eed9eae1b8a576c9df807b9f2bcd42f7844740318afcd5c4630292e05f7',
-                  'sear_steak': '13065718c2af99758c7d8afad4c4ccb3da3638943d92d81a688a49a97a795d5e'}}
+ 'anchored4dgs': {'coffee_martini': '0490dd70994f29f629f6b49e1e3129afb7a1b6de5ec4319d40c4d5ab907bddc8',
+                  'cook_spinach': '21cb84215834eb6d5821486ac62cfd73f15b0d8d75aacddeb2de71428f014368',
+                  'flame_steak': '13faf386771d19cda24318d4d02f7c73b26c3c3749994383b78425defefbc8e3',
+                  'sear_steak': '8ccd72fefeb71b75d493d239fbcc03e6954c47d127e728d4732c703503cee429'}}
 DATA_SHA256 = {'coffee_martini': {'cam00.mp4': '09cc8b695b78ef13d7e02a3a8a1e7e4f5a9f915730c4515c7cc9bcd06c843ad9',
                     'cam01.mp4': 'e508e9d36e7456b62baed1c1dca1b329cd6c3dd552df5b8d23a350df7f57e396',
                     'cam02.mp4': 'f23ad58769f22343980b9d82f5e922b5edce30b77eea954543e35969edb418bf',
@@ -126,6 +154,39 @@ DATA_SHA256 = {'coffee_martini': {'cam00.mp4': '09cc8b695b78ef13d7e02a3a8a1e7e4f
                 'cam20.mp4': '0a3c26c642437f8780cd7f0d25dea761df6317ef8be50df95777e75bd33287b2',
                 'poses_bounds.npy': 'e436726227fbdcab1095aa326b98cfc32be5da535a9137b9ed157e9a1640e465'}}
 
+# Checkpoint digests for the two official-camera inference inputs.
+MODEL_SHA256["ex4dgs"].update({
+    "dance3": "9efd284ebac2a10a0ab08f0e82443c78c444c701978cd14ef352491bd2d2d743",
+    "actor1_4": "2b417357d4f4bb7de6e2063d1c231e97df29121b3d747dee1ef8faa3276e70e1",
+})
+MODEL_SHA256["4dgs1k"].update({
+    "dance3": "1af70cd4d389785131311713baa39ca1382b2b6a97ef747b7554fad20b2e709b",
+    "actor1_4": "3b0d1e70042940e402521dd609b5a5c371b6d68bdc3efb50323d5519b076788f",
+})
+MODEL_SHA256["anchored4dgs"].update({
+    "dance3": "2851551556dfbfe50ac0b30058235086636c6469eb0c0f36002aeecc06a77e33",
+    "actor1_4": "3c93325c5136c6333b416b209bb923b23a324f5508f0aae0ffb01479961e14c2",
+})
+
+MODEL_PARAMETERS = {
+    "4dgs1k": {
+        "dance3": {"source_iteration": 8537, "finetune_steps": 1970, "frame_count": 300},
+        "actor1_4": {"source_iteration": 7495, "finetune_steps": 3265, "frame_count": 200},
+    },
+    "ex4dgs": {
+        "dance3": {"release": None, "iterations": 2837, "duration": 300, "resolution": 1, "near": .2, "background": 0},
+        "actor1_4": {"release": None, "iterations": 2720, "duration": 200, "resolution": 1, "near": .2, "background": 0},
+    },
+    "anchored4dgs": {
+        "coffee_martini": {"training_steps": 658, "source_iteration": 21500, "frame_count": 300},
+        "cook_spinach": {"training_steps": 803, "source_iteration": 22500, "frame_count": 300},
+        "sear_steak": {"training_steps": 1459, "source_iteration": 19500, "frame_count": 300},
+        "flame_steak": {"training_steps": 1110, "source_iteration": 7500, "frame_count": 300},
+        "dance3": {"training_steps": 1939, "source_iteration": 8537, "frame_count": 300},
+        "actor1_4": {"training_steps": 1850, "source_iteration": 7495, "frame_count": 200},
+    },
+}
+
 
 @dataclass(frozen=True)
 class Workload:
@@ -147,6 +208,14 @@ class Workload:
     def sha256(self, scene: str) -> str:
         return MODEL_SHA256[self.directory][scene]
 
+    def parameters_for(self, scene: str) -> dict[str, object]:
+        return dict(self.parameters) | MODEL_PARAMETERS.get(self.directory, {}).get(scene, {})
+
+    def download_url(self, scene: str) -> str | None:
+        if self.model_url is None or scene in OFFICIAL_SCENE_SOURCES:
+            return None
+        return self.model_url.format(scene=scene)
+
 
 WORKLOADS = {
     "explicit4d": Workload("explicit4d", "4dgs1k", "pth", "images", "cam00_", None,
@@ -160,7 +229,7 @@ WORKLOADS = {
                     ("far", 300.0), ("kernel_size", .1))),
     "anchored": Workload("anchored", "anchored4dgs", "pth", "images", "cam00_", None,
         "https://doi.org/10.1145/3757377.3763898",
-        (("training_steps", 2000), ("feature_dim", 32), ("hidden_dim", 32),
+        (("feature_dim", 32), ("hidden_dim", 32),
          ("bindings", 10), ("tau_t", .05), ("growth_decay", .1),
          ("timespan_quantile", .5), ("spatial_voxel", .001), ("temporal_voxel", .033),
          ("static_after", 1500), ("opacity", "tanh"), ("covariance_input", "feature"),
@@ -169,7 +238,8 @@ WORKLOADS = {
 }
 # Training source and final steps of the supplied compact explicit4d files.
 EXPLICIT4D_STEPS = dict(coffee_martini=(20000, 21500), cook_spinach=(21000, 22500),
-                        flame_steak=(6000, 7500), sear_steak=(16500, 19500))
+                        flame_steak=(6000, 7500), sear_steak=(16500, 19500),
+                        dance3=(8537, 10507), actor1_4=(7495, 10760))
 
 
 def combinations(workload="all", scene="all"):
