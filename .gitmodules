@@ -1,0 +1,3 @@
+[submodule "third_party/Golden-Ratio"]
+	path = third_party/Golden-Ratio
+	url = https://github.com/MAdrid1011/Golden-Ratio.git

@@ -12,6 +12,39 @@ from .hcf import HCFResult
 from .model import Camera, FrameGeometry, Geometry
 
 
+def load_kernel(name, cache):
+    """Compile shared CUDA kernels into an external, content-keyed cache."""
+    from torch.utils.cpp_extension import load
+    from pathlib import Path
+    import hashlib
+    import torch
+
+    folder = Path(__file__).with_name('pim_kernels')
+    source = folder / f'{name}.cu'
+    inputs = [source]
+    includes = [folder]
+    if name == 'ex4dgs_generation_publication':
+        inputs.append(folder / 'ex4dgs_generation.cu')
+    if name == 'mean':
+        inputs.append(folder / 'Reduce.cuh')
+    if name == 'projection':
+        import gsplat
+        upstream = Path(gsplat.__file__).parent / 'cuda'
+        includes.extend((upstream / 'include', upstream / 'csrc', upstream / 'csrc/third_party/glm'))
+        inputs.extend((upstream / 'include/Common.h', upstream / 'include/Utils.cuh', upstream / 'csrc/Projection.h'))
+    flags = ['-O3', *(['-use_fast_math'] if name == 'projection' else [])]
+    digest = hashlib.sha256(repr((torch.__version__, torch.version.cuda,
+        torch.cuda.get_device_capability(), flags)).encode())
+    for path in inputs:
+        digest.update(path.read_bytes())
+    module = f'gspim_record_{name}_{digest.hexdigest()[:16]}'
+    directory = Path(cache) / 'cuda' / module
+    directory.mkdir(parents=True, exist_ok=True)
+    binary = load(module, [str(source)], build_directory=str(directory),
+                  extra_cuda_cflags=flags, extra_include_paths=list(map(str, includes)), verbose=False)
+    return binary
+
+
 @dataclass(frozen=True)
 class RenderedFrame:
     width: int
@@ -197,12 +230,40 @@ class CUDARenderer:
             model.motion, model.motion_rotation, model.opacity_variance, model.interval,
             float(model.config["var_pad"]),
         ) if self.generation_model is not None else None)
+        self.window_statistics = None
         if self.generation_parameters is not None:
+            from .pim_record_ops import DepthStatistics
+            self.window_statistics = DepthStatistics(load_kernel('depth', cache), self.ops)
+            self.window_statistics.generation_binary = load_kernel('ex4dgs_generation', cache)
+            self.window_statistics.generation_trace_binary = load_kernel('ex4dgs_generation_publication', cache)
+            self.window_statistics.generation_view = model.view
+            self.window_statistics.generation_span = (
+                float(model.config.get('stability_far', model.config['far'])) -
+                float(model.config.get('stability_near', model.config['near'])))
             # Finish immutable checkpoint preparation before another stream
             # can submit inference through this renderer.
             torch.cuda.current_stream(model.xyz.device).synchronize()
 
     def generate(self, model, times):
+        if hasattr(model, 'selected_dynamic'):
+            source = self.generation_model
+            statistics = self.window_statistics
+            if statistics.mode is None:
+                return tuple(value.index_select(1, model.source_ids)
+                             for value in self.generate(source, times))
+            statistics.validate = False
+            motion, rotation, variance = self.generation_parameters
+            binary = (statistics.generation_trace_binary if statistics.trace_binary is not None
+                      else statistics.generation_binary)
+            result = binary.generate(source.xyz, source.displacement, motion, source.rotation,
+                rotation, source.scales, source.opacity, source.opacity_center, variance,
+                times, source.duration, source.interval, source.time_shift,
+                float(source.config['var_pad']), model.view, statistics.generation_span,
+                statistics.mode, model.selected_dynamic)
+            statistics.generated[result[0].data_ptr()] = result[3:]
+            statistics.last_generation_publication = result[6]
+            statistics.last_generation_loads = result[7]
+            return result[:3]
         if hasattr(model, "anchor_positions"):
             torch = self.torch
             features = model.anchor_features
@@ -308,7 +369,7 @@ class CUDARenderer:
         )
         # The masked compositor accepts packed batch/tile keys and replaces
         # them with coordinates before launching CTAs. Other paths use linear jobs.
-        packed_jobs = shared and width > 1 and id_bits > 0 and id_bits + width + 8 <= 32
+        packed_jobs = shared and id_bits > 0 and id_bits + width + 8 <= 32
         jobs, offsets, counts = self.ops.tile_ranges(
             keys, 1 if shared else width, batches, tile_width * tile_height, 0, packed_jobs)
         boundaries = (torch.searchsorted(assignment[0], torch.arange(batches + 1, device=orders.device))

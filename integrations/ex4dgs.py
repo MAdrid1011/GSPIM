@@ -15,8 +15,8 @@ class Ex4DGSCheckpoint:
 
     def __init__(self, path: Path, device: str = "cuda") -> None:
         import ast
-        import io
         import json
+        import tempfile
         import zipfile
 
         import numpy as np
@@ -29,6 +29,14 @@ class Ex4DGSCheckpoint:
             def read(name: str) -> bytes:
                 return archive.read(name) if archive else (path / name).read_bytes()
 
+            def vertices(name: str):
+                if archive is None:
+                    return PlyData.read(path / name)["vertex"].data
+                with tempfile.TemporaryFile() as stream:
+                    stream.write(archive.read(name))
+                    stream.seek(0)
+                    return PlyData.read(stream)["vertex"].data
+
             expression = ast.parse(read("cfg_args").decode("utf-8"), mode="eval").body
             if not isinstance(expression, ast.Call) or not isinstance(expression.func, ast.Name) or expression.func.id != "Namespace" or expression.args:
                 raise ValueError("cfg_args must contain literal Namespace keyword arguments")
@@ -39,8 +47,8 @@ class Ex4DGSCheckpoint:
                 raise ValueError("native inference requires N3V cameras and degree-three SH")
             self.cameras = json.loads(read("cameras.json"))
             prefix = f"point_cloud/iteration_{int(self.config['iterations'])}/"
-            static = PlyData.read(io.BytesIO(read(prefix + "point_cloud.ply")))["vertex"].data
-            dynamic = PlyData.read(io.BytesIO(read(prefix + "dynamic_point_cloud.ply")))["vertex"].data
+            static = vertices(prefix + "point_cloud.ply")
+            dynamic = vertices(prefix + "dynamic_point_cloud.ply")
         finally:
             if archive:
                 archive.close()
@@ -90,5 +98,35 @@ class Ex4DGSCheckpoint:
         camera_to_world[:3, 3] = torch.tensor(camera["position"], device=device)
         self.view = camera_to_world.inverse()[None].contiguous()
         self.camera_position = camera_to_world[:3, 3].contiguous()
-        self.intrinsics = torch.tensor([[[camera["fx"] / resolution, 0, self.width / 2], [0, camera["fy"] / resolution, self.height / 2], [0, 0, 1]]], device=device)
+        self.intrinsics = torch.tensor([[[camera["fx"] / resolution, 0, camera.get("cx", camera["width"] / 2) / resolution],
+                                        [0, camera["fy"] / resolution, camera.get("cy", camera["height"] / 2) / resolution],
+                                        [0, 0, 1]]], device=device)
         self.name = path.stem if path.is_file() else path.name
+        amplitude = self.opacity[len(self.xyz):].double()
+        centers = self.opacity_center.double()
+        sigma = self.opacity_variance.double().exp() + float(self.config['var_pad']) / self.interval / 2.36
+        cutoff = 1 / 255 - 2 ** -20
+        extent = (amplitude.clamp_min(cutoff) / cutoff).log().sqrt()
+        lower = torch.minimum(centers.amin(-1), centers.amax(-1) - sigma[:, 0] * extent)
+        upper = centers.amax(-1) + sigma[:, 1] * extent
+        bounds = (torch.stack((lower, upper), -1) * self.interval - self.time_shift) / 30
+        bounds[:, 0] -= 2 ** -20
+        bounds[:, 1] += 2 ** -20
+        bounds[amplitude < cutoff] = self.duration / 30 + 1
+        self.temporal_intervals = bounds.float()
+
+    def select_dataflow(self, times, first=None):
+        """Select conservative opacity support while preserving source keyframes."""
+        from copy import copy
+        import torch
+
+        first = int(times[0]) if first is None else first
+        bounds = self.temporal_intervals
+        dynamic = ((bounds[:, 0] <= (first + len(times) - 1) / 30) &
+                   (bounds[:, 1] >= first / 30)).nonzero().flatten()
+        selected = copy(self)
+        selected.selected_dynamic = dynamic
+        selected.source_ids = torch.cat((torch.arange(len(self.xyz), device=times.device),
+                                         dynamic + len(self.xyz)))
+        selected.sh = self.sh.index_select(0, selected.source_ids)
+        return selected

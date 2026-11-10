@@ -238,7 +238,7 @@ def make_batch_plan(
     return tuple(batches)
 
 
-def cuda_render_orders(means, view, near: float, far: float, operators):
+def cuda_render_orders(means, view, near: float, far: float, operators, statistics=None):
     """Classify the native window and merge CUB-sorted stable/unstable IDs.
 
     Sorting keys for the stable sequence are window minima, including during
@@ -248,9 +248,12 @@ def cuda_render_orders(means, view, near: float, far: float, operators):
 
     if not isfinite(near) or not isfinite(far) or far <= near:
         raise ValueError("depth stability requires finite, increasing camera bounds")
-    depth = (means @ view[0, 2, :3] + view[0, 2, 3]).contiguous()
+    if statistics is None:
+        depth = (means @ view[0, 2, :3] + view[0, 2, 3]).contiguous()
+        score, minimum = operators.window_statistics(depth, far - near)
+    else:
+        depth, score, minimum = statistics.run(means, view, far - near)
     width, count = depth.shape
-    score, minimum = operators.window_statistics(depth, far - near)
     stable, unstable, next_delta = operators.classify(score)
 
     def sort(values, keys):
@@ -275,7 +278,7 @@ def cuda_batch_boundaries(orders, stable_ids, projected, shared_bytes: int, l2_b
     radii, xy = projected[:2]
     properties = torch.cuda.get_device_properties(device)
     tile_width, tile_height = (image_width + 15) // 16, (image_height + 15) // 16
-    masked = shared_tiles and count > 0 and width > 1 and count.bit_length() + width + 8 <= 32
+    masked = shared_tiles and count > 0 and count.bit_length() + width + 8 <= 32
     if resident_blocks is None:
         if operators is None:
             raise ValueError("reference planning requires the device's resident block limit")
@@ -287,7 +290,7 @@ def cuda_batch_boundaries(orders, stable_ids, projected, shared_bytes: int, l2_b
     # its backing storage. A signed T carries termination for multi-frame paths.
     parts = 2 if masked else 1
     resident_tiles = min(properties.multi_processor_count * resident_blocks, width * tiles * parts)
-    reserved = resident_tiles * (256 // parts) * (16 if width > 1 else 17)
+    reserved = resident_tiles * (256 // parts) * (16 if width > 1 or masked else 17)
     reserved += width * tiles * (4 if masked else 1)
     # Shared jobs have one tile list, while independent lists have one per frame.
     reserved += (1 if shared_tiles else width) * tiles * (8 + 4) + 4

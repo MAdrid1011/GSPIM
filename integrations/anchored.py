@@ -65,20 +65,33 @@ class AnchoredCheckpoint:
         self.opacity_mlp = decoder("opacity_mlp", 32, 10, torch.nn.Tanh())
         self.covariance_mlp = decoder("covariance_mlp", 32, 120)
         self.color_mlp = decoder("color_mlp", 35, 30, torch.nn.Sigmoid())
-        original = np.load(images.parent / "poses_bounds.npy")[:, :15].reshape(-1, 3, 5)
-        height, width, focal = original[0, :, -1]
-        self.width, self.height = int(width)//2, int(height)//2
-        focal = float(focal)/2
-        c2w = np.eye(4)
-        c2w[:3, :3] = original[0, :, :3][:, [1, 0, 2]]*np.array([1, 1, -1])
-        c2w[:3, 3] = original[0, :, 3]
+        camera = payload.get('camera')
+        if camera is None:
+            original = np.load(images.parent / "poses_bounds.npy")[:, :15].reshape(-1, 3, 5)
+            height, width, focal = original[0, :, -1]
+            self.width, self.height = int(width)//2, int(height)//2
+            fx = fy = float(focal)/2
+            cx, cy = self.width/2, self.height/2
+            c2w = np.eye(4)
+            c2w[:3, :3] = original[0, :, :3][:, [1, 0, 2]]*np.array([1, 1, -1])
+            c2w[:3, 3] = original[0, :, 3]
+        else:
+            c2w = np.asarray(camera['camera_to_world'], dtype=np.float64)
+            self.width, self.height = int(camera['width']), int(camera['height'])
+            fx, fy, cx, cy = (float(camera[key]) for key in ('fx', 'fy', 'cx', 'cy'))
+            if (c2w.shape != (4, 4) or not np.isfinite(c2w).all() or
+                    min(self.width, self.height) < 1 or min(fx, fy) <= 0 or
+                    not np.isfinite([fx, fy, cx, cy]).all()):
+                raise ValueError('invalid checkpoint camera calibration')
         self.view = torch.tensor(np.linalg.inv(c2w), dtype=torch.float32, device=device)[None].contiguous()
         self.camera_position = torch.tensor(c2w[:3, 3], dtype=torch.float32, device=device)
-        self.intrinsics = torch.tensor([[[focal, 0, self.width/2], [0, focal, self.height/2],
+        self.intrinsics = torch.tensor([[[fx, 0, cx], [0, fy, cy],
                                          [0, 0, 1]]], dtype=torch.float32, device=device)
         self.xyz = self.anchor_positions[:, :3].contiguous()
         self.sh = self.xyz.new_empty((0, 0, 3))
-        self.name, self.duration = path.stem, 300
+        self.name, self.duration = path.stem, int(payload.get('frame_count', 300))
+        if not 2 <= self.duration <= 300:
+            raise ValueError('checkpoint frame count must lie in 2..300')
         self.iteration = payload["iteration"]
         self.workload, self.image_prefix = "anchored", "cam00_"
         self.config = dict(kernel_size=.3, near=.2, far=float("inf"), background=0,

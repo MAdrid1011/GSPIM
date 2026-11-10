@@ -49,4 +49,35 @@ task's final completion. Workspace releases follow the consuming task's lifetime
 
 The CUDA renderer uses stream events to order projection, metadata preparation,
 and composition. Cross-stream tensor lifetimes are recorded on the consuming
-stream. Timing uses frame completion events as described in [running](running.md).
+stream.
+
+## GPU and memory timeline
+
+`pim_record` runs the shared GPU Dataflow pipeline and records generation,
+projection, window adjustment, sorting, color publication, culling, and consumer
+tasks. Representation adapters supply explicit or anchored generation fields.
+Fixed CUDA publication kernels compile in the external cache. The recorder
+checks images and window decisions across parallel and serial GPU execution.
+
+`pim_capture` connects recorded GPU tasks to field publications, input reads,
+block completions, and frame completion events. `pim_requests` translates active
+selection, stability classification, field gathering, and tile packing into
+32-byte physical memory requests. The three representations provide their own
+active fields and generation tasks to the same request and scheduling interface.
+
+`pim_memory` advances paired LPDDR5 dies through Ramulator while GPU tasks execute
+on the same timeline. `pim_schedule` admits GPU tasks according to available SMs,
+registers, shared memory, producer dependencies, and window buffers. Each channel
+has a 128-request window; field traffic uses twelve bank queues, and each die has
+16 KiB of staging storage. A consumer starts after its inputs are published and
+physically complete. Completion drains all GPU tasks, memory requests, and staging
+allocations.
+
+Ready consumers prefer the oldest window, then the largest published input
+workload within that window. Producer tasks retain their stage ordering.
+
+Independent-frame PIM uses one-frame activity and depth keys. It preserves GPU
+frame order while overlapping the next frame's PIM preparation with the current
+frame's GPU stages. Serial Dataflow+PIM drains each batch before admitting the next
+batch or window. Full GSPIM permits packing, GPU consumption, and the next window's
+preparation to overlap according to the same input and buffer dependencies.

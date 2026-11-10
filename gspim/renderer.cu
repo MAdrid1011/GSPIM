@@ -401,7 +401,7 @@ __global__ void window_statistics_kernel(const float *depth, int N, int W,
     previous = d;
   }
   minimum[g] = low;
-  float mean = __fmul_rn(change, 1.f / (W - 1));
+  float mean = W > 1 ? __fmul_rn(change, 1.f / (W - 1)) : 0.f;
   score[g] = expf(__fmul_rn(-mean, 1.f / range));
 }
 std::vector<Tensor> window_statistics(Tensor depth, float range) {
@@ -831,7 +831,7 @@ std::vector<Tensor> cull_tiles_impl(Tensor keys, Tensor ids, Tensor xy,
     ++shift;
   auto stream = at::cuda::getCurrentCUDAStream();
   auto flags = torch::empty_like(ids), scan = torch::empty_like(ids);
-  bool masked = id_bits > 0 && xy.size(0) > 1 && id_bits + xy.size(0) + 8 <= 32;
+  bool masked = id_bits > 0 && id_bits + xy.size(0) + 8 <= 32;
   Tensor support;
   if (masked) {
     support = torch::empty({xy.size(0) * xy.size(1), 4}, xy.options());
@@ -934,7 +934,7 @@ __global__ void packed_offsets(int *layout, const uint64_t *prefix, int N) {
 Tensor packed_layout(Tensor xy, Tensor radii, Tensor conics, Tensor opacity) {
   c10::cuda::CUDAGuard guard(xy.device());
   int N = xy.size(1), W = xy.size(0);
-  TORCH_CHECK(W >= 2 && W <= 5 && int64_t(N) * W * 9 < (1 << 28),
+  TORCH_CHECK(W >= 1 && W <= 5 && int64_t(N) * W * 9 < (1 << 28),
               "packed layout exceeds the descriptor range");
   auto integers = xy.options().dtype(torch::kInt32);
   auto layout = torch::zeros({3, N + 1}, integers);
@@ -1187,6 +1187,19 @@ __global__ void job_boundaries(const int64_t *jobs, int *begins, int n, int B,
   begins[bi] = lo;
 }
 template <typename Key>
+__global__ void dense_shared_ranges(const Key *keys, int n, int tiles,
+                                   int shift, int total, int64_t *jobs,
+                                   int *offsets) {
+  int i=blockIdx.x*blockDim.x+threadIdx.x;
+  if(i>total)return;
+  Key key=(Key(i/tiles)<<shift)|(i%tiles);
+  int lo=0,hi=n;
+  while(lo<hi){int mid=lo+(hi-lo)/2;if(keys[mid]<key)lo=mid+1;else hi=mid;}
+  offsets[i]=lo;
+  if(i<total)jobs[i]=key;
+}
+
+template <typename Key>
 std::tuple<Tensor, Tensor, std::vector<int64_t>>
 tile_ranges_impl(Tensor keys, int W, int B, int tiles, int drop_bits, bool packed_jobs) {
   c10::cuda::CUDAGuard guard(keys.device());
@@ -1199,6 +1212,15 @@ tile_ranges_impl(Tensor keys, int W, int B, int tiles, int drop_bits, bool packe
             torch::zeros({1}, integers),
             std::vector<int64_t>(B, 0)};
   auto stream = at::cuda::getCurrentCUDAStream();
+  if(packed_jobs && !drop_bits && B<=4) {
+    int total=B*tiles;
+    auto jobs=torch::empty({total},keys.options().dtype(torch::kInt64));
+    auto offsets=torch::empty({total+1},integers);
+    dense_shared_ranges<<<(total+256)/256,256,0,stream>>>(
+        keys.data_ptr<Key>(),n,tiles,shift,total,jobs.data_ptr<int64_t>(),offsets.data_ptr<int>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {jobs,offsets,std::vector<int64_t>(B,tiles)};
+  }
   Tensor input = keys;
   if (drop_bits) {
     input = torch::empty_like(keys);
@@ -1793,12 +1815,12 @@ __global__ void batch_multi_pixel_kernel(
         local_color = colors[g];
         local_op = opacity[g];
       }
-      // Compute the cutoff once per staged candidate rather than per pixel.
-      // Retain a margin around the exp/alpha floating-point boundary.
+      // Stage log2 opacity and base-two quadratic coefficients per candidate.
       staged[threadIdx.x] = {
-          make_float4(local_xy.x, local_xy.y, local_conic.x, local_conic.y),
-          make_float4(local_conic.z, local_op, local_color.x, local_color.y),
-          make_float4(local_color.z, __logf(255.f * local_op) + 1e-4f,
+          make_float4(local_xy.x, local_xy.y, __fmul_rn(-.7213475204444817f, local_conic.x),
+                      __fmul_rn(-1.4426950408889634f, local_conic.y)),
+          make_float4(__fmul_rn(-.7213475204444817f, local_conic.z), local_op, local_color.x, local_color.y),
+          make_float4(local_color.z, __log2f(local_op),
                       __uint_as_float(local_op > 0 ? region_mask : 0), 0)};
     }
     __syncthreads();
@@ -1819,11 +1841,10 @@ __global__ void batch_multi_pixel_kernel(
         float2 p = make_float2(value.geometry.x, value.geometry.y);
         float3 a = make_float3(value.geometry.z, value.geometry.w, value.color.x);
         float3 col = make_float3(value.color.z, value.color.w, value.extra.x);
-        float op = value.color.y;
-        float cutoff = value.extra.y;
+        float log_opacity = value.extra.y;
         float dx = p.x - (x + .5f);
-        float xhalf = __fmul_rn(.5f, __fmul_rn(__fmul_rn(a.x, dx), dx));
-        float yhalf = __fmul_rn(.5f, a.z);
+        float xhalf = __fmaf_rn(__fmul_rn(a.x, dx), dx, log_opacity);
+        float yhalf = a.z;
         float cross = __fmul_rn(a.y, dx);
 #pragma unroll
         for (int q = 0; q < Pixels; ++q) {
@@ -1832,12 +1853,14 @@ __global__ void batch_multi_pixel_kernel(
           float dy = p.y - (y + q * 4 + .5f);
           // Share the x contribution across the thread's two pixel rows.
           float sigma = __fmaf_rn(dy, __fmaf_rn(dy, yhalf, cross), xhalf);
-          if (sigma < 0 || sigma > cutoff)
+          float exponent;
+          asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(exponent) : "f"(sigma));
+          float alpha = fminf(.999f, exponent);
+          if (sigma > log_opacity)
             continue;
-          float alpha = fminf(.999f, op * __expf(-sigma));
           if (alpha < 1.f / 255.f)
             continue;
-          float next = T[q] * (1 - alpha);
+          float next = __fmaf_rn(-alpha, T[q], T[q]);
           dirty_bits |= 1u << (q * 2);
           if (stop_threshold > 0 && next <= stop_threshold) {
             done_bits |= 1u << (q * 2);
@@ -1954,7 +1977,7 @@ Tensor batches(Tensor xy, Tensor c, Tensor col, Tensor op, Tensor offsets,
   int W = xy.size(0), tw = (width + 15) / 16, th = (height + 15) / 16;
   // Batch-major rendering revisits C/T frequently. Use one aligned load and
   // store; a negative T marks a stopped pixel without losing its magnitude.
-  bool packed_state = W > 1;
+  bool packed_state = W > 1 || id_bits > 0;
   bool masked = packed_state && id_bits > 0 && id_bits + W + 8 <= 32;
   // The caller may supply attributes already in the common ROL sequence.
   // Other callers retain the general primitive-ID to packed-rank mapping.

@@ -13,16 +13,19 @@ class IntegrationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             Ex4DGSLayout.from_mappings(({"primitive_id": 1},))
 
-    def test_manifest_covers_twelve_combinations_and_real_coffee_ids(self):
+    def test_manifest_covers_eighteen_combinations_and_real_coffee_ids(self):
         from integrations.manifest import DATA_SHA256, combinations
 
         pairs = tuple(combinations())
-        self.assertEqual(len(pairs), 12)
-        self.assertEqual(len({(workload.name, scene) for workload, scene in pairs}), 12)
+        self.assertEqual(len(pairs), 18)
+        self.assertEqual(len({(workload.name, scene) for workload, scene in pairs}), 18)
         cameras = sorted(name for name in DATA_SHA256["coffee_martini"] if name.endswith(".mp4"))
         self.assertEqual(len(cameras), 18)
         self.assertNotIn("cam03.mp4", cameras)
         self.assertIn("cam20.mp4", cameras)
+        self.assertIn("dance3", {scene for _, scene in pairs})
+        self.assertIn("actor1_4", {scene for _, scene in pairs})
+        self.assertTrue(all(not hasattr(workload, "model_url") for workload, _ in pairs))
 
     def test_missing_inputs_are_listed_without_preparation(self):
         import tempfile
@@ -34,5 +37,6 @@ class IntegrationTests(unittest.TestCase):
             problems = input_problems(combinations("anchored", "coffee_martini"), Path(temporary))
         self.assertEqual(len(problems), 3)
         self.assertTrue(any("checkpoints/anchored4dgs/coffee_martini.pth" in item for item in problems))
+        self.assertTrue(any("GSPIM checkpoint bundle" in item for item in problems))
         self.assertTrue(any("300 missing images" in item for item in problems))
         download.assert_not_called()

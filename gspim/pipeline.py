@@ -731,11 +731,12 @@ class CUDAPipeline:
         self.projection_stream = torch.cuda.Stream(device=model.xyz.device)
         self.l2_bytes = torch.cuda.get_device_properties(model.xyz.device).L2_cache_size
 
-    def dataflow(self, times, first=None):
+    def dataflow(self, times, first=None, *, execution=None):
         import torch
         from .dataflow import cuda_render_orders
 
-        model = self.model.select(times, first) if hasattr(self.model, "select") else self.model
+        model = (self.model.select_dataflow(times, first) if hasattr(self.model, 'select_dataflow') else
+                 self.model.select(times, first) if hasattr(self.model, "select") else self.model)
         generated = self.renderer.generate(model, times)
         if hasattr(model, "anchor_positions"):
             # A binding below the compositor's alpha cutoff in every frame
@@ -748,25 +749,39 @@ class CUDAPipeline:
         self.projection_stream.wait_stream(current)
         with torch.cuda.stream(self.projection_stream):
             projected = self.renderer.project(model, generated, True)
+            if execution is not None:
+                execution.remember(generated[0], projected)
         for value in generated:
             value.record_stream(self.projection_stream)
-        orders, adjustment, stable, depth = cuda_render_orders(
+        ordering = execution.orders if execution is not None else cuda_render_orders
+        render = execution.render_window if execution is not None else self._render_window
+        colors_for = execution.colors if execution is not None else self.renderer.colors
+        orders, adjustment, stable, depth = ordering(
             generated[0], model.view,
             float(model.config.get("stability_near", model.config["near"])),
             float(model.config.get("stability_far", model.config["far"])), self.renderer.ops,
+            **({} if execution is not None else {'statistics': self.renderer.window_statistics}),
         )
         shared_tiles = len(stable) == orders.shape[1]
         current.wait_stream(self.projection_stream)
         for value in projected:
             value.record_stream(current)
+        if not shared_tiles:
+            visible_unstable = (projected[0] > 0).all(-1).any(0)
+            visible_unstable[stable.long()] = False
+            shared_tiles = not bool(visible_unstable.any())
         if shared_tiles:
-            selected, crossed = self.renderer.ops.visible_order(stable, projected[0], depth)
-            if crossed:
-                if len(times) > 3:
-                    colors = self.renderer.colors(model, generated[0], projected[0])
+            selected, crossed = (execution.visible(stable, projected[0], depth)
+                                 if execution is not None else
+                                 self.renderer.ops.visible_order(stable, projected[0], depth))
+            if crossed or len(times) == 1:
+                if len(times) > 3 or len(times) == 1:
+                    colors = colors_for(model, generated[0], projected[0])
                     projected = (*projected[:4], colors, projected[5])
-                # A high SS does not rule out rank crossings. Preserve the
-                # external ready-window, but shorten its shared-order spans
+                    if execution is not None:
+                        execution.publish(projected)
+                # A high stability score does not rule out rank crossings.
+                # Preserve the configured ready-window, but shorten its shared-order spans
                 # and center each span's key in time to reduce order bias.
                 width = len(times)
                 spans = ((0, 3), (3, 5)) if width == 5 else (
@@ -789,10 +804,13 @@ class CUDAPipeline:
                             selected, projected[0][first:last], depth.new_empty(0))
                         ordered_depth = depth[first:last, span_selected]
                         key = ordered_depth.mean(0).contiguous()
-                        repaired = self.renderer.ops.radix(
-                            key, torch.arange(len(span_selected), dtype=torch.int32,
-                                              device=selected.device), 0, 32)[1]
-                        shared_order = span_selected[repaired.long()]
+                        if execution is not None:
+                            shared_order = execution.span(self.renderer.ops, key, span_selected)
+                        else:
+                            repaired = self.renderer.ops.radix(
+                                key, torch.arange(len(span_selected), dtype=torch.int32,
+                                                  device=selected.device), 0, 32)[1]
+                            shared_order = span_selected[repaired.long()]
                         local = tuple(value[first:last] if value.numel() else value
                                       for value in projected)
                         span_model = model
@@ -800,7 +818,7 @@ class CUDAPipeline:
                             from copy import copy
                             span_model = copy(model)
                             span_model.frame_times = model.frame_times[first:last]
-                        _, batches, footprint = self._render_window(
+                        _, batches, footprint = render(
                             generated[0][first:last], local, orders[first:last],
                             shared_order, True, image[first:last], shared_order,
                             wait_for=render_done, model=span_model)
@@ -812,7 +830,7 @@ class CUDAPipeline:
                 if len(spans) > 1:
                     current.wait_stream(self.projection_stream)
                 return image[..., :3], adjustment, total_batches, maximum_footprint
-        image, batches, footprint = self._render_window(
+        image, batches, footprint = render(
             generated[0], projected, orders, stable, shared_tiles,
             visible_ids=selected if shared_tiles else None, model=model)
         return image, adjustment, batches, footprint
@@ -895,18 +913,14 @@ class CUDAPipeline:
         generated = self.renderer.generate(model, time)
         return self.renderer.frame(model, self.renderer.project(model, generated))
 
-    def evaluate(self, images, output, frame_count: int, repeats: int = 4, warmup: int = 20) -> None:
-        """Measure actual frame completions and emit one Markdown report.
-
-        Both modes use the same adaptive ready-window partition determined by
-        an untimed prepass. Window-control work is repeated inside timed
-        Dataflow runs. Disk decoding and quality metrics run separately.
-        """
+    def evaluate(self, images, output, frame_count: int, repeats: int = 4, warmup: int = 20) -> dict[str, object]:
+        """Render the selected frames and emit one Markdown summary."""
         from pathlib import Path
 
         import numpy as np
         import torch
         from PIL import Image
+        import hashlib
         from .renderer import cuda_image_quality
 
         if frame_count < 2 or frame_count > self.model.duration or repeats < 1 or warmup < 1:
@@ -979,6 +993,8 @@ class CUDAPipeline:
                     latencies[mode].extend(ready.elapsed_time(done) for ready, events in records for done in events)
                     print(f"{self.model.name} {mode} repeat {repeat + 1}: {frame_count * 1000 / durations[mode][-1]:.3f} FPS", flush=True)
             quality = {name: [] for name in durations}
+            dataflow_rgb_sha256 = []
+            maximum_rgb_error = 0.0
             for start, size in windows:
                 dataflow, _, _, _ = self.dataflow(times[start:start + size], start)
                 for local, frame in enumerate(range(start, start + size)):
@@ -991,41 +1007,51 @@ class CUDAPipeline:
                     baseline = self.baseline(times[frame:frame + 1], frame)
                     quality["baseline"].append(cuda_image_quality(baseline, target))
                     quality["dataflow"].append(cuda_image_quality(dataflow[local], target))
-        lines = [f"# {self.model.name}", "", f"Device: {torch.cuda.get_device_name(self.model.xyz.device)}. Resolution: {self.model.width} x {self.model.height}.",
-                 f"Frames: {frame_count}; measured repeats: {repeats}; warmup windows: {warmup}.",
-                 f"Workload: {getattr(self.model, 'workload', 'ex4dgs')}; FP32; background: {'black' if self.model.config.get('background', 1) == 0 else 'white'}.",
-                 f"Raster bounds: {self.model.config['near']} to {self.model.config['far']}; stability bounds: {self.model.config.get('stability_near', self.model.config['near'])} to {self.model.config.get('stability_far', self.model.config['far'])}.",
-                 "Alpha cutoff: 1/255; alpha cap: 0.999; transmittance stop: 1e-4.",
-                 "CUDA events measure end-to-end execution under identical ready-window submission; latency uses actual per-frame completion events.",
-                 "Model and GT loading, warmup, prepass, and quality calculation are outside the measurement interval.",
-                 f"L2: {self.l2_bytes} bytes; maximum estimated batch footprint: {maximum_footprint} bytes; maximum batch count: {maximum_batches}.", "",
-                 "| Path | FPS | P95 ms | P99 ms | PSNR dB | SSIM |", "| --- | ---: | ---: | ---: | ---: | ---: |"]
-        if hasattr(self.model, "iteration"):
-            provenance = f"Checkpoint training step: {self.model.iteration}."
-            if hasattr(self.model, "source_iteration"):
-                provenance += f" Source step: {self.model.source_iteration}; masked fine-tuning updates: {self.model.iteration - self.model.source_iteration}."
-            lines[3:3] = [provenance]
-        if hasattr(self.model, "anchor_count"):
-            lines[4:4] = [f"Anchors: {self.model.anchor_count}; static anchors: {self.model.static_anchor_count}; bound Gaussians: {self.model.anchor_count * 10}."]
-        elif hasattr(self.model, "source_count"):
-            lines[4:4] = [f"Pruned Gaussians: {self.model.source_count}."]
-        for mode in durations:
-            fps = frame_count * repeats * 1000 / sum(durations[mode])
-            p95, p99 = np.quantile(latencies[mode], (0.95, 0.99), method="linear")
-            psnr, ssim = np.mean(quality[mode], axis=0)
-            lines.append(f"| {mode} | {fps:.6f} | {p95:.6f} | {p99:.6f} | {psnr:.6f} | {ssim:.6f} |")
-        speedup = sum(durations["baseline"]) / sum(durations["dataflow"])
-        differences = np.asarray(quality["dataflow"]) - np.asarray(quality["baseline"])
-        mean_difference = differences.mean(0)
-        maximum_difference = np.abs(differences).max(0)
-        lines.extend(("", f"Measured speedup: {speedup:.6f}x.",
-                      f"Scene-level Dataflow - baseline PSNR/SSIM: {mean_difference[0]:+.6f} dB / {mean_difference[1]:+.8f}.",
-                      f"Maximum per-frame absolute PSNR/SSIM changes: {maximum_difference[0]:.6f} dB / {maximum_difference[1]:.8f}.",
-                      "", "| Repeat | Baseline ms | Dataflow ms |", "| ---: | ---: | ---: |"))
-        lines.extend(f"| {index + 1} | {base:.6f} | {flow:.6f} |" for index, (base, flow) in enumerate(zip(durations["baseline"], durations["dataflow"])))
-        lines.extend(("", "## Per-frame samples", "", "| Frame | Baseline PSNR | Dataflow PSNR | Baseline SSIM | Dataflow SSIM |", "| ---: | ---: | ---: | ---: | ---: |"))
-        lines.extend(f"| {index} | {base[0]:.6f} | {flow[0]:.6f} | {base[1]:.6f} | {flow[1]:.6f} |" for index, (base, flow) in enumerate(zip(quality["baseline"], quality["dataflow"])))
-        lines.extend(("", "| Latency sample | Baseline ms | Dataflow ms |", "| ---: | ---: | ---: |"))
-        lines.extend(f"| {index} | {base:.6f} | {flow:.6f} |" for index, (base, flow) in enumerate(zip(latencies["baseline"], latencies["dataflow"])))
+                    dataflow_rgb_sha256.append(hashlib.sha256(
+                        dataflow[local].detach().cpu().contiguous().numpy().tobytes()).hexdigest())
+                    maximum_rgb_error = max(
+                        maximum_rgb_error,
+                        float((baseline - dataflow[local]).abs().max().item()),
+                    )
+        baseline_ms = float(np.mean(durations["baseline"]))
+        dataflow_ms = float(np.mean(durations["dataflow"]))
+        p95_baseline = float(np.percentile(latencies["baseline"], 95))
+        p99_baseline = float(np.percentile(latencies["baseline"], 99))
+        p95_dataflow = float(np.percentile(latencies["dataflow"], 95))
+        p99_dataflow = float(np.percentile(latencies["dataflow"], 99))
+        baseline_quality = np.mean(quality["baseline"], axis=0)
+        dataflow_quality = np.mean(quality["dataflow"], axis=0)
+        speedup = baseline_ms / dataflow_ms
+        lines = [f"# {self.model.name}", "",
+                 f"Frames: {frame_count}; repeats: {repeats}; warmup windows: {warmup}.", "",
+                 "| Path | Speedup | Time (ms/frame) | P95 (ms) | P99 (ms) | PSNR | SSIM |",
+                 "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+                 f"| baseline | 1.000000x | {baseline_ms/frame_count:.6f} | {p95_baseline:.6f} | {p99_baseline:.6f} | {baseline_quality[0]:.6f} | {baseline_quality[1]:.6f} |",
+                 f"| dataflow | {speedup:.6f}x | {dataflow_ms/frame_count:.6f} | {p95_dataflow:.6f} | {p99_dataflow:.6f} | {dataflow_quality[0]:.6f} | {dataflow_quality[1]:.6f} |"]
         output.mkdir(parents=True, exist_ok=True)
         (output / "summary.md").write_text("\n".join(lines) + "\n", encoding="ascii")
+        return {
+            "workload": getattr(self.model, "workload", "ex4dgs"),
+            "scene": self.model.name,
+            "frames": frame_count,
+            "repeats": repeats,
+            "warmup": warmup,
+            "windows": windows,
+            "duration_samples_ms": durations,
+            "frame_latency_samples_ms": latencies,
+            "baseline_ms": baseline_ms,
+            "dataflow_ms": dataflow_ms,
+            "baseline_fps": float(frame_count * 1000 / baseline_ms),
+            "dataflow_fps": float(frame_count * 1000 / dataflow_ms),
+            "p95_baseline_ms": p95_baseline,
+            "p99_baseline_ms": p99_baseline,
+            "p95_dataflow_ms": p95_dataflow,
+            "p99_dataflow_ms": p99_dataflow,
+            "psnr_baseline": float(baseline_quality[0]),
+            "ssim_baseline": float(baseline_quality[1]),
+            "psnr_dataflow": float(dataflow_quality[0]),
+            "ssim_dataflow": float(dataflow_quality[1]),
+            "max_rgb_error": maximum_rgb_error,
+            "quality_samples": quality,
+            "dataflow_rgb_sha256": dataflow_rgb_sha256,
+        }

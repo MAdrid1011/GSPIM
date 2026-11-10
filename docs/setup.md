@@ -2,15 +2,15 @@
 
 ## CUDA environment
 
-Use Linux, Python 3.10 through 3.12, an NVIDIA CUDA GPU, the CUDA toolkit with `nvcc`,
+Use Linux, Python 3.11 or 3.12, an NVIDIA CUDA GPU, the CUDA toolkit with `nvcc`,
 and a host C++ compiler supported by that toolkit. The CUDA dependencies are
 PyTorch 2.5.0, gsplat 1.5.3, NumPy 2.0.1, Pillow 12.1.1, plyfile, and Ninja.
 Pillow and NumPy versions preserve the image conversion described in [data](data.md).
 
-Install FFmpeg and Git using the system package manager. For example, on Ubuntu:
+Install FFmpeg, Git and CMake using the system package manager. For example, on Ubuntu:
 
 ```bash
-sudo apt-get install ffmpeg git ninja-build
+sudo apt-get install ffmpeg git cmake ninja-build
 ```
 
 Install PyTorch using a wheel compatible with the installed toolkit. For CUDA 12.1:
@@ -32,12 +32,15 @@ Compilation uses `~/.cache/gspim/` and defaults to two parallel jobs. `MAX_JOBS`
 can override the compilation concurrency. An optional `--cache` selects another
 cache directory outside the checkout.
 
-## Model construction dependencies
+## Upstream dependencies
 
-`python -m gspim.demo --prepare` also creates pinned upstream source checkouts in
-`third_party/`. Training functions use the original 4DGS rasterizer and utilities,
-and fused-ssim for the loss. Install their additional Python dependencies after
-the CUDA environment is ready:
+`python -m gspim.demo --prepare` creates the pinned Ramulator2 checkout in
+`third_party/` and initializes the Golden-Ratio plotting submodule. The CUDA
+renderer loads the compact checkpoints registered in `integrations/manifest.py`.
+
+The optional model-construction functions use the original 4DGS rasterizer and
+utilities, and fused-ssim for the loss. Install their additional Python dependencies
+only when constructing checkpoints:
 
 ```bash
 python -m pip install --no-build-isolation -e '.[training]'
