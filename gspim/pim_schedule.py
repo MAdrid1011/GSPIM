@@ -304,3 +304,81 @@ def serial_boundaries(bundle):
         previous = max(span for span, descriptor in enumerate(bundle['spans'])
                        if descriptor['window'] == window - 1)
         nodes[bundle['windows'][window]['start']]['parents'].append((drains[previous], 0))
+
+
+def frame_pipeline(bundle):
+    """Overlap next-frame PIM preparation while keeping GPU frames serial."""
+    ctas = bundle['ctas']
+    staged_publication = any(cta['kind'] in ('decoder', 'projection_finish')
+                             for cta in ctas)
+    nodes = bundle['nodes']
+    windows = bundle['windows']
+    frames = bundle['frame_events']
+    if len(windows) != len(frames) or any(window['width'] != 1 for window in windows):
+        raise ValueError('frame pipeline requires one window per frame')
+
+    drains = []
+    for frame in frames:
+        assert frame['complete']
+        drains.append(len(nodes))
+        nodes.append(dict(earliest=0, duration=0, kind='frame_drain',
+                          parents=[(parent, 0) for parent in frame['complete']],
+                          memory=[], publications=[]))
+
+    span_windows = [descriptor['window'] for descriptor in bundle['spans']]
+    if staged_publication:
+        for cta in ctas:
+            if cta['kind'] != 'consumer':
+                continue
+            window = span_windows[cta['span']]
+            if window:
+                edge = (drains[window - 1], 0)
+                if edge not in nodes[cta['first']]['parents']:
+                    nodes[cta['first']]['parents'].append(edge)
+    else:
+        for span, descriptor in enumerate(bundle['spans']):
+            window = span_windows[span]
+            if not window:
+                continue
+            edge = (drains[window - 1], 0)
+            nodes[descriptor['sort']]['parents'].append(edge)
+            first, last = windows[window]['start'], descriptor['sort']
+            for cta in ctas:
+                if not first <= cta['first'] <= last:
+                    continue
+                early = cta['kind'] in ('generation', 'projection', 'colors')
+                if not early and edge not in nodes[cta['first']]['parents']:
+                    nodes[cta['first']]['parents'].append(edge)
+
+        for window in range(2, len(windows)):
+            edge = (drains[window - 2], 0)
+            if edge not in nodes[windows[window]['start']]['parents']:
+                nodes[windows[window]['start']]['parents'].append(edge)
+
+    for node in nodes:
+        if node['kind'] == 's1_publication':
+            publications = {((int(bundle['requests'][die]['tag'][index]) >> 16) & 255)
+                            for die, index in node['publications']}
+            assert len(publications) == 1
+            window = publications.pop()
+            edge = (windows[window]['start'], 0)
+            if edge not in node['parents']:
+                node['parents'].append(edge)
+            continue
+        if staged_publication:
+            continue
+        if node['kind'] not in ('field_source', 'route_source'):
+            continue
+        spans = set()
+        for die, index in node['publications']:
+            lane = int(bundle['requests'][die]['tag'][index]) >> 24
+            if node['kind'] == 'field_source':
+                spans.add(lane // 2)
+            else:
+                spans.add((lane - 2 * len(bundle['spans'])) // 4)
+        assert len(spans) == 1
+        window = span_windows[spans.pop()]
+        if window >= 2:
+            edge = (drains[window - 2], 0)
+            if edge not in node['parents']:
+                node['parents'].append(edge)

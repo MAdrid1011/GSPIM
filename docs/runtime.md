@@ -76,7 +76,8 @@ allocations.
 Ready consumers prefer the oldest window, then the largest published input
 workload within that window. Producer tasks retain their stage ordering.
 
-Independent-frame PIM uses one-frame activity and depth keys. Serial Dataflow+PIM
-drains each batch before admitting the next batch or window. Full GSPIM permits
-packing, GPU consumption, and the next window's preparation to overlap according
-to the same input and buffer dependencies.
+Independent-frame PIM uses one-frame activity and depth keys. It preserves GPU
+frame order while overlapping the next frame's PIM preparation with the current
+frame's GPU stages. Serial Dataflow+PIM drains each batch before admitting the next
+batch or window. Full GSPIM permits packing, GPU consumption, and the next window's
+preparation to overlap according to the same input and buffer dependencies.

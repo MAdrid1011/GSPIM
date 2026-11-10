@@ -3,6 +3,7 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+import ast
 import hashlib
 import os
 import time
@@ -10,8 +11,10 @@ import time
 import numpy as np
 
 from .pim_memory import FeedbackGraph, MemoryBackend
-from .pim_schedule import (Resources, block_dependencies, field_queues, prepare,
-                           release_fields, serial_boundaries, validate_staging)
+from .pim_schedule import (Resources, block_dependencies, field_queues, frame_pipeline,
+                           prepare, release_fields, serial_boundaries, validate_staging)
+
+SCHEDULE_ABI = b'gspim-schedule-2'
 
 
 @dataclass
@@ -105,8 +108,7 @@ def load_trace(path):
 
 
 def load_or_build(workload, scene, root, frames=10, *, independent=False,
-                  model=None, checkpoint=None, images=None, cache=None,
-                  repeats=4, warmup=20):
+                  model=None, checkpoint=None, images=None, cache=None):
     """Reuse matching traces or record the selected GPU path into the cache."""
     suffix = '.frame.trace.npz' if independent else '.trace.npz'
     path = Path(root) / 'traces' / workload / f'{scene}{suffix}'
@@ -119,7 +121,7 @@ def load_or_build(workload, scene, root, frames=10, *, independent=False,
 
     import torch
     source = Path(__file__).parent
-    key = hashlib.sha256(repr((workload, scene, frames, independent, identity, repeats, warmup,
+    key = hashlib.sha256(repr((workload, scene, frames, independent, identity,
         torch.__version__, torch.version.cuda, torch.cuda.get_device_name(),
         torch.cuda.get_device_capability())).encode())
     for name in ('pim_capture.py', 'pim_record.py', 'pim_record_ops.py',
@@ -153,7 +155,7 @@ def load_or_build(workload, scene, root, frames=10, *, independent=False,
         print(f'Recording {workload}/{scene} ({frames} frames, '
               f'{"independent" if independent else "Dataflow"})', flush=True)
         capture = record(model, workload, checkpoint, images, cache, frames,
-                         independent=independent, repeats=repeats, warmup=warmup)
+                         independent=independent)
         gc.collect()
         torch.cuda.empty_cache()
         with tempfile.TemporaryDirectory(prefix='capture-', dir=folder) as temporary:
@@ -175,13 +177,16 @@ def load_or_build(workload, scene, root, frames=10, *, independent=False,
     return trace
 
 
-def _schedule_destination(trace, library, config, overlap, cache):
+def _schedule_destination(trace, library, config, overlap, cache, *, frame_order=False):
     if cache is None:
         return None
     source = Path(__file__)
-    digest = hashlib.sha256((trace.sha256 + str(overlap)).encode())
-    for path in (source, source.with_name('pim_memory.py'), source.with_name('pim_schedule.py'),
-                 Path(library), Path(config)):
+    mode = str((overlap, frame_order)) if frame_order else str(overlap)
+    digest = hashlib.sha256(SCHEDULE_ABI + (trace.sha256 + mode).encode())
+    for path in (source.with_name('pim_memory.py'), source.with_name('pim_schedule.py')):
+        tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+        digest.update(ast.dump(tree, include_attributes=False).encode())
+    for path in (Path(library), Path(config)):
         digest.update(path.read_bytes())
     return Path(cache) / 'pim' / 'schedules' / f'{digest.hexdigest()}.npz'
 
@@ -221,6 +226,25 @@ def _prepare_bundle_after_queues(bundle):
     return work
 
 
+def _frame_times(bundle, times):
+    """Return ready-window submission and per-frame completion cycles."""
+    completed = []
+    for frame in bundle['frame_events']:
+        assert frame['complete']
+        completed.append(max(int(times[node, 1]) for node in frame['complete']))
+    completed = np.asarray(completed, dtype=np.int64)
+    submitted = np.empty(len(completed), dtype=np.int64)
+    previous_completion = 0
+    for window in bundle['windows']:
+        first = int(window['first_frame'])
+        last = first + int(window['width'])
+        ready = max(int(times[window['start'], 0]), previous_completion)
+        submitted[first:last] = ready
+        completed[first:last] = np.maximum(completed[first:last], ready)
+        previous_completion = int(completed[first:last].max())
+    return submitted, completed
+
+
 def _advance_schedule(trace, bundle, work, backend, started, workers):
     resources = Resources(bundle, work)
     graph = FeedbackGraph(backend)
@@ -236,13 +260,9 @@ def _advance_schedule(trace, bundle, work, backend, started, workers):
                 for kind, key in enumerate(('gpu_reads', 'gpu_writes', 'local_reads', 'local_writes'))}
     assert counts == expected
     times = feedback['task_times']
-    submitted, completed = [], []
-    for frame in bundle['frame_events']:
-        assert frame['complete']
-        submitted.append(int(times[frame['submit'], 0]))
-        completed.append(max(int(times[node, 1]) for node in frame['complete']))
-    submitted = np.asarray(submitted) * 1.25e-6
-    completed = np.asarray(completed) * 1.25e-6
+    submitted, completed = _frame_times(bundle, times)
+    submitted = submitted * 1.25e-6
+    completed = completed * 1.25e-6
     assert np.all(completed >= submitted)
     milliseconds = feedback['total_cycles'] * 1.25e-6
     assert milliseconds >= completed.max()
@@ -252,16 +272,22 @@ def _advance_schedule(trace, bundle, work, backend, started, workers):
     return result
 
 
-def simulate(trace, *, library, config, workers=8, overlap=True, cache=None):
+def simulate(trace, *, library, config, workers=8, overlap=True, frame_order=False,
+             cache=None):
     """Advance finite GPU and memory resources through final drain."""
-    destination = _schedule_destination(trace, library, config, overlap, cache)
+    destination = _schedule_destination(trace, library, config, overlap, cache,
+                                        frame_order=frame_order)
     if destination is not None and destination.is_file():
         return _read_schedule(destination, trace)
     bundle = trace.bundle
     if bundle.get('_prepared'):
         raise ValueError('load a fresh trace before running a second schedule')
     started = time.perf_counter()
-    if not overlap:
+    if frame_order:
+        if not overlap:
+            raise ValueError('frame ordering retains overlap within each frame')
+        frame_pipeline(bundle)
+    elif not overlap:
         serial_boundaries(bundle)
     queues, work = _prepare_bundle(bundle)
     backend = MemoryBackend(library, config)
@@ -320,18 +346,20 @@ def simulate_dataflow_pair(trace, *, library, config, workers=8, cache=None):
 def _simulate_independent(path, library, config, cache, workers):
     trace = load_trace(path)
     simulate(trace, library=library, config=config, workers=workers,
-             overlap=False, cache=cache)
-    return str(_schedule_destination(trace, library, config, False, cache))
+             overlap=True, frame_order=True, cache=cache)
+    return str(_schedule_destination(trace, library, config, True, cache,
+                                     frame_order=True))
 
 
 def simulate_all(trace, independent, *, library, config, workers=8, cache=None):
     """Run the three ablation schedules concurrently when their caches are cold."""
-    destination = _schedule_destination(independent, library, config, False, cache)
+    destination = _schedule_destination(independent, library, config, True, cache,
+                                        frame_order=True)
     if destination is None or destination.is_file():
         pim, serial = simulate_dataflow_pair(
             trace, library=library, config=config, workers=workers, cache=cache)
         pim_only = simulate(independent, library=library, config=config, workers=workers,
-                            overlap=False, cache=cache)
+                            overlap=True, frame_order=True, cache=cache)
         return pim, serial, pim_only
 
     import multiprocessing
@@ -373,6 +401,10 @@ def _read_schedule(source, trace):
         metadata = _MetadataReader(io.BytesIO(zlib.decompress(values['metadata'].tobytes()))).load()
         result = ScheduleResult(**metadata, **{key: values[key].copy() for key in
             ('latency_ms', 'submitted_ms', 'completed_ms', 'task_times')})
+    submitted, completed = _frame_times(trace.metadata, result.task_times)
+    result.submitted_ms = submitted * 1.25e-6
+    result.completed_ms = completed * 1.25e-6
+    result.latency_ms = result.completed_ms - result.submitted_ms
     if (result.trace_sha256 != trace.sha256 or result.capture_sha256 != trace.metadata['capture_sha256'] or
             len(result.completed_ms) != trace.frames or not np.isfinite(result.completed_ms).all() or
             np.any(result.completed_ms < result.submitted_ms) or

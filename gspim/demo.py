@@ -36,14 +36,31 @@ PLOT_MODEL_NAMES = {
 
 
 def _load_registered_trace(workload, scene, frames, identity, *, independent=False, **options):
-    """Use a compatible prepared trace before recording one into the cache."""
+    """Use a matching prepared trace before recording one into the cache."""
     suffix = ".frame.trace.npz" if independent else ".trace.npz"
     path = ROOT / "traces" / workload / f"{scene}{suffix}"
-    if path.is_file():
-        trace = load_trace(path)
+    candidates = [(path, True)] if path.is_file() else []
+    cache = options.get("cache")
+    if cache is not None:
+        folder = Path(cache) / "pim" / "traces"
+        cached = folder.glob(f"{workload}-{scene}-*.trace.npz")
+        candidates.extend((candidate, False) for candidate in sorted(
+            (candidate for candidate in cached
+             if candidate.name.endswith(suffix) and
+             (independent or not candidate.name.endswith(".frame.trace.npz"))),
+            key=lambda candidate: candidate.stat().st_mtime,
+            reverse=True,
+        ))
+    for candidate, registered in candidates:
+        try:
+            trace = load_trace(candidate)
+        except (EOFError, OSError, ValueError):
+            if registered:
+                raise
+            continue
         if trace.frames == frames and trace.metadata.get("input_sha256") == identity:
             if independent and any(window["width"] != 1 for window in trace.metadata["windows"]):
-                raise ValueError(f"independent-frame PIM requires single-frame windows: {path}")
+                raise ValueError(f"independent-frame PIM requires single-frame windows: {candidate}")
             return trace
     return load_or_build(workload, scene, ROOT, frames, independent=independent, **options)
 
@@ -211,8 +228,7 @@ def _run_pair(workload, scene, *, frames, repeats, warmup, checkpoint, images,
     else:
         from integrations.ex4dgs import Ex4DGSCheckpoint
         model = Ex4DGSCheckpoint(checkpoint)
-    trace_options = dict(model=model, checkpoint=checkpoint, images=images, cache=cache,
-                         repeats=repeats, warmup=warmup)
+    trace_options = dict(model=model, checkpoint=checkpoint, images=images, cache=cache)
     trace_frames = min(run_frames, 10)
     identity = input_identity(checkpoint, images, model, trace_frames)
     trace = _load_registered_trace(workload.name, scene, trace_frames, identity,

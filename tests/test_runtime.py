@@ -90,3 +90,78 @@ class RuntimeTests(unittest.TestCase):
         runtime.complete_gpu_stage("s2-b1", "S2", (event.task_id,))
         runtime.complete("reorg", TaskOutcome(1, (LiveRange("active", 0, 1),), (block,), ()))
         self.assertTrue(runtime.event("reorg").complete)
+
+    def test_independent_frames_overlap_pim_preparation_but_serialize_consumers(self):
+        from gspim.pim_schedule import frame_pipeline
+
+        def node(kind):
+            return dict(earliest=0, duration=1, kind=kind, parents=[], memory=[],
+                        publications=[])
+
+        bundle = {
+            "nodes": [node("start"), node("consumer"), node("complete-0"),
+                      node("complete-1")],
+            "windows": [{"width": 1, "start": 0}, {"width": 1, "start": 0}],
+            "frame_events": [{"complete": [2]}, {"complete": [3]}],
+            "spans": [{"window": 0}, {"window": 1}],
+            "ctas": [{"kind": "decoder", "span": 1, "first": 0},
+                     {"kind": "consumer", "span": 1, "first": 1}],
+            "requests": [],
+        }
+        frame_pipeline(bundle)
+        self.assertNotIn((4, 0), bundle["nodes"][0]["parents"])
+        self.assertIn((4, 0), bundle["nodes"][1]["parents"])
+
+    def test_window_latency_keeps_early_pim_preparation_outside_ready_time(self):
+        import numpy as np
+        from gspim.pim import _frame_times
+
+        bundle = {
+            "windows": [
+                {"start": 0, "first_frame": 0, "width": 2},
+                {"start": 1, "first_frame": 2, "width": 2},
+            ],
+            "frame_events": [
+                {"complete": [2]}, {"complete": [3]},
+                {"complete": [4]}, {"complete": [5]},
+            ],
+        }
+        times = np.asarray([
+            [0, 0], [2, 2], [0, 10], [0, 12], [0, 11], [0, 18],
+        ], dtype=np.int64)
+        submitted, completed = _frame_times(bundle, times)
+        np.testing.assert_array_equal(submitted, [0, 0, 12, 12])
+        np.testing.assert_array_equal(completed, [10, 12, 12, 18])
+
+    def test_trace_discovery_skips_invalid_external_cache(self):
+        import os
+        import tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from gspim.demo import _load_registered_trace
+
+        with tempfile.TemporaryDirectory() as temporary:
+            cache = Path(temporary)
+            traces = cache / "pim" / "traces"
+            traces.mkdir(parents=True)
+            invalid = traces / "ex4dgs-coffee_martini-new.trace.npz"
+            valid = traces / "ex4dgs-coffee_martini-old.trace.npz"
+            invalid.touch()
+            valid.touch()
+            os.utime(invalid, (2, 2))
+            os.utime(valid, (1, 1))
+            expected = SimpleNamespace(frames=10, metadata={"input_sha256": "inputs"})
+
+            def load(path):
+                if path == invalid:
+                    raise ValueError("invalid trace")
+                return expected
+
+            with patch("gspim.demo.load_trace", side_effect=load), \
+                    patch("gspim.demo.load_or_build") as build:
+                actual = _load_registered_trace(
+                    "ex4dgs", "coffee_martini", 10, "inputs", cache=cache)
+
+            self.assertIs(actual, expected)
+            build.assert_not_called()
