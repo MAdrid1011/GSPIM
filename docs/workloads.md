@@ -14,11 +14,11 @@ sources, upstream revisions, and model parameters. Scene names are
 | `ex4dgs` | Static Gaussians and interpolated dynamic keyframes | `checkpoints/ex4dgs/<scene>.zip` |
 | `anchored` | 4D anchors, ten bindings each, and neural decoders | `checkpoints/anchored4dgs/<scene>.pth` |
 
-The GSPIM checkpoint bundle contains the selected checkpoint for every row. Extract
-the bundle into `checkpoints/` so that it produces the paths above. The manifest
-records each file's SHA256; `--prepare` verifies present files and lists every
-missing path. It does not obtain a different checkpoint from a method repository
-or start training.
+The GSPIM checkpoint bundle in the project
+[Releases](https://github.com/MAdrid1011/GSPIM/releases) contains the selected
+checkpoint for every row. Extract the bundle at the repository root so that it
+produces the paths above. The manifest records each file's SHA256; `--prepare`
+verifies present files and lists every missing path.
 
 The Ex4DGS archives contain PLY fields, configuration, and cameras. The adapter
 evaluates each archive directly, using cubic position interpolation and quaternion
@@ -112,8 +112,7 @@ for every scene.
 
 Training checkpoints live in `checkpoints/training/anchored4dgs/`; exports retain
 anchor parameters, decoder weights, static flags, and conservative time intervals
-at the manifest inference paths. Training and export are Python functions; preparation
-checks or downloads inputs without invoking these functions.
+at the manifest inference paths. The rendering path reads these compact exports.
 
 ## Pinned sources
 

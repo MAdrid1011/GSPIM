@@ -35,8 +35,8 @@ cache directory outside the checkout.
 ## Upstream dependencies
 
 `python -m gspim.demo --prepare` creates the pinned Ramulator2 checkout in
-`third_party/` and initializes the Golden-Ratio plotting submodule. Rendering uses
-the supplied GSPIM checkpoint bundle and does not require model-training sources.
+`third_party/` and initializes the Golden-Ratio plotting submodule. The CUDA
+renderer loads the compact checkpoints registered in `integrations/manifest.py`.
 
 The optional model-construction functions use the original 4DGS rasterizer and
 utilities, and fused-ssim for the loss. Install their additional Python dependencies

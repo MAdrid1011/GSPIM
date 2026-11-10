@@ -5,6 +5,20 @@ Polymorphic PIM (PPIM), a Hierarchical Compaction Fabric (HCF), and task schedul
 models. It supports explicit 4D Gaussians with contribution masks, Ex4DGS keyframes,
 and four-dimensional anchors with neural decoders across six camera scenes.
 
+## Inputs
+
+Download the GSPIM checkpoint bundle from the project
+[Releases](https://github.com/MAdrid1011/GSPIM/releases) and extract it at the
+repository root. The resulting `checkpoints/` tree contains one checkpoint for
+each of the eighteen workload/scene combinations.
+
+The complete six-scene run also uses the official Dance3 and Actor1_4 packages.
+Request them from [Mobile-Stage](https://docs.google.com/forms/d/e/1FAIpQLSeEbjuTV7w0lfryl-9FPX1VteuPGkbqjDvxXebY02Tm6BMejQ/viewform?usp=sf_link)
+and [ENeRF-Outdoor](https://docs.google.com/forms/d/e/1FAIpQLSeFAgcnJEDYEaco4vA2QsD-bM8V8CRFuiR0QWbi_3uXmXtUKg/viewform?usp=sf_link),
+then place `dance3_libx265.tar.gz` and `actor1_4_libx265.tar.gz` in
+`~/.cache/gspim/downloads/`. The remaining four scene packages are downloaded
+by the preparation command.
+
 ## Install and run
 
 Use a CUDA-enabled Python environment with FFmpeg and a compatible C++ compiler.
@@ -16,13 +30,10 @@ python -m gspim.demo --prepare
 python -m gspim.demo
 ```
 
-Preparation downloads public datasets where available, preprocesses images, and
-checks the supplied GSPIM checkpoints in `checkpoints/`. Extract the GSPIM
-checkpoint bundle at that path before running; preparation never trains or
-substitutes models. Model paths and formats are described in
-[workloads](docs/workloads.md). The default run evaluates
-all eighteen workload/scene combinations with a ten-frame quick pass and writes
-the result tables and charts to `outputs/`.
+Preparation downloads, converts, and verifies the registered inputs. Model paths
+and formats are described in [workloads](docs/workloads.md). The default run
+evaluates all eighteen workload/scene combinations with a ten-frame quick pass
+and writes the result tables and charts to `outputs/`.
 
 ## Repository
 

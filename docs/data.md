@@ -28,10 +28,9 @@ datasets/n3v/<scene>/
 Preparation verifies existing original files and processes up to four camera videos
 concurrently, skipping completed image sequences.
 A repeated invocation fills missing images without replacing complete images.
-Delete a corrupt file before preparing again. Checkpoints are distributed as the
-GSPIM checkpoint bundle rather than as part of a dataset download. A missing
-checkpoint is reported with its required destination; see
-[workloads](workloads.md).
+Delete a corrupt file before preparing again. Checkpoints are distributed in the
+GSPIM release bundle and verified at their registered paths. A missing checkpoint
+is reported with its required destination; see [workloads](workloads.md).
 
 Obtain Dance3 from [Mobile-Stage](https://docs.google.com/forms/d/e/1FAIpQLSeEbjuTV7w0lfryl-9FPX1VteuPGkbqjDvxXebY02Tm6BMejQ/viewform?usp=sf_link)
 and Actor1_4 from [ENeRF-Outdoor](https://docs.google.com/forms/d/e/1FAIpQLSeFAgcnJEDYEaco4vA2QsD-bM8V8CRFuiR0QWbi_3uXmXtUKg/viewform?usp=sf_link).

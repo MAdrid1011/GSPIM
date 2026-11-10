@@ -2,16 +2,20 @@
 
 ## All combinations or one combination
 
-From the checkout, prepare inputs and run all eighteen combinations:
+Extract the GSPIM checkpoint bundle from the project
+[Releases](https://github.com/MAdrid1011/GSPIM/releases) at the repository root.
+For the complete six-scene run, place `dance3_libx265.tar.gz` and
+`actor1_4_libx265.tar.gz` in `~/.cache/gspim/downloads/` as described in
+[data preparation](data.md). Then prepare inputs and run all eighteen combinations:
 
 ```bash
 python -m gspim.demo --prepare
 python -m gspim.demo
 ```
 
-Preparation downloads and preprocesses public datasets and checks the supplied
-GSPIM checkpoint bundle. It does not download substitute checkpoints or start
-training. Rendering checks every selected input before loading CUDA models.
+Preparation downloads the four Neural 3D Video scenes, converts all six scene
+packages, initializes pinned dependencies, and verifies the registered checkpoint
+SHA256 values. Rendering checks every selected input before loading CUDA models.
 Missing inputs produce a list of paths and preparation instructions.
 
 The first run compiles GPU publication kernels and builds compact PIM traces
