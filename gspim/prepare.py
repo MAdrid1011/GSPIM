@@ -1,4 +1,4 @@
-"""Download and prepare registered inputs without starting training."""
+"""Prepare registered datasets and verify the supplied checkpoints."""
 
 from __future__ import annotations
 
@@ -49,7 +49,7 @@ def download(url: str, destination: Path, digest: str | None = None) -> None:
 
 
 def prepare_upstreams(root: Path = ROOT) -> None:
-    """Initialize pinned rendering, simulation, training and plotting sources."""
+    """Initialize pinned simulation and plotting sources."""
     for upstream in UPSTREAMS:
         destination = root / "third_party" / upstream.name
         if upstream == GOLDEN_RATIO and (root / ".gitmodules").is_file():
@@ -337,9 +337,9 @@ def input_problems(pairs, root: Path = ROOT, frames: int = FRAMES,
         model = checkpoint or workload.checkpoint(scene, root)
         image_root = images or workload.image_directory(scene, root)
         if not model.is_file():
-            method = ("run python -m gspim.demo --prepare" if workload.download_url(scene) else
-                      f"place the supplied {workload.directory} model at this path; see docs/workloads.md")
-            problems.append(f"{model}: {method}")
+            problems.append(
+                f"{model}: extract the GSPIM checkpoint bundle at checkpoints/; "
+                "see docs/workloads.md")
         if workload.name != "ex4dgs" and not (image_root.parent / "poses_bounds.npy").is_file():
             problems.append(f"{image_root.parent / 'poses_bounds.npy'}: run python -m gspim.demo --prepare")
         required_frames = min(frames, SCENE_FRAMES.get(scene, frames))
@@ -361,9 +361,6 @@ def prepare(pairs, root: Path = ROOT, cache: Path = CACHE) -> list[str]:
     for workload, scene in pairs:
         checkpoint = workload.checkpoint(scene, root)
         checkpoint.parent.mkdir(parents=True, exist_ok=True)
-        url = workload.download_url(scene)
-        if not checkpoint.is_file() and url is not None:
-            download(url, checkpoint, workload.sha256(scene))
         if checkpoint.is_file():
             verify_file(checkpoint, workload.sha256(scene))
     prepare_upstreams(root)

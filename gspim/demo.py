@@ -287,7 +287,8 @@ def _run_pair_child(connection, args):
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Prepare inputs or run GSPIM CUDA workloads")
-    parser.add_argument("--prepare", action="store_true", help="prepare public data and check supplied models")
+    parser.add_argument("--prepare", action="store_true",
+                        help="prepare datasets and check supplied GSPIM checkpoints")
     parser.add_argument("--workload", choices=(*WORKLOADS, "all"), default="all")
     parser.add_argument("--scene", choices=(*SCENES, "all"), default="all")
     parser.add_argument("--out", type=Path, help="report directory (default: outputs/<workload>/<scene>)")

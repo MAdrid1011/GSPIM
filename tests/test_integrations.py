@@ -25,6 +25,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("cam20.mp4", cameras)
         self.assertIn("dance3", {scene for _, scene in pairs})
         self.assertIn("actor1_4", {scene for _, scene in pairs})
+        self.assertTrue(all(not hasattr(workload, "model_url") for workload, _ in pairs))
 
     def test_missing_inputs_are_listed_without_preparation(self):
         import tempfile
@@ -36,5 +37,6 @@ class IntegrationTests(unittest.TestCase):
             problems = input_problems(combinations("anchored", "coffee_martini"), Path(temporary))
         self.assertEqual(len(problems), 3)
         self.assertTrue(any("checkpoints/anchored4dgs/coffee_martini.pth" in item for item in problems))
+        self.assertTrue(any("GSPIM checkpoint bundle" in item for item in problems))
         self.assertTrue(any("300 missing images" in item for item in problems))
         download.assert_not_called()

@@ -3,8 +3,8 @@
 ## Representations and scenes
 
 The workload manifest is [`integrations/manifest.py`](../integrations/manifest.py).
-It defines all eighteen combinations, their default paths, public sources, SHA256
-values, upstream revisions, and model parameters. Scene names are
+It defines all eighteen combinations, their default paths, SHA256 values, method
+sources, upstream revisions, and model parameters. Scene names are
 `coffee_martini`, `cook_spinach`, `flame_steak`, `sear_steak`, `dance3`, and
 `actor1_4`.
 
@@ -14,17 +14,18 @@ values, upstream revisions, and model parameters. Scene names are
 | `ex4dgs` | Static Gaussians and interpolated dynamic keyframes | `checkpoints/ex4dgs/<scene>.zip` |
 | `anchored` | 4D anchors, ten bindings each, and neural decoders | `checkpoints/anchored4dgs/<scene>.pth` |
 
-Ex4DGS v0.1 archives are downloaded from the
-[upstream release](https://github.com/juno181/Ex4DGS/releases/tag/v0.1).
-They contain PLY fields, configuration, and cameras. The adapter evaluates the
-archive directly, using cubic position interpolation and quaternion slerp. The
-four Neural 3D Video archives record 40000 training iterations, 300 frames,
-keyframe interval ten,
-time padding two, variance padding three, resolution divisor two, SH degree
-three, clipping bounds four to 300, and projection kernel size 0.1. Place the
-supplied compact 1K and Anchored models at the paths above; their public download
-URLs are unset in the manifest. `--prepare` verifies available models and lists
-missing ones.
+The GSPIM checkpoint bundle contains the selected checkpoint for every row. Extract
+the bundle into `checkpoints/` so that it produces the paths above. The manifest
+records each file's SHA256; `--prepare` verifies present files and lists every
+missing path. It does not obtain a different checkpoint from a method repository
+or start training.
+
+The Ex4DGS archives contain PLY fields, configuration, and cameras. The adapter
+evaluates each archive directly, using cubic position interpolation and quaternion
+slerp. The four Neural 3D Video checkpoints record 40000 training iterations, 300
+frames, keyframe interval ten, time padding two, variance padding three, resolution
+divisor two, SH degree three, clipping bounds four to 300, and projection kernel
+size 0.1.
 
 Dance3 and Actor1_4 use the official Mobile-Stage and ENeRF-Outdoor camera
 packages. Their access-controlled source packages are converted to the same

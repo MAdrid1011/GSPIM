@@ -34,11 +34,13 @@ cache directory outside the checkout.
 
 ## Upstream dependencies
 
-`python -m gspim.demo --prepare` also creates pinned upstream source checkouts in
-`third_party/` and initializes the Golden-Ratio plotting submodule. Training
-functions use the original 4DGS rasterizer and utilities, and fused-ssim for the
-loss. Install their additional Python dependencies after
-the CUDA environment is ready:
+`python -m gspim.demo --prepare` creates the pinned Ramulator2 checkout in
+`third_party/` and initializes the Golden-Ratio plotting submodule. Rendering uses
+the supplied GSPIM checkpoint bundle and does not require model-training sources.
+
+The optional model-construction functions use the original 4DGS rasterizer and
+utilities, and fused-ssim for the loss. Install their additional Python dependencies
+only when constructing checkpoints:
 
 ```bash
 python -m pip install --no-build-isolation -e '.[training]'

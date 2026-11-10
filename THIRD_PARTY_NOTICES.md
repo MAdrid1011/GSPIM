@@ -5,8 +5,7 @@ installed dependencies retain their respective licenses and notices.
 
 - [Ex4DGS](https://github.com/juno181/Ex4DGS), Junoh Lee et al., NeurIPS 2024:
   revision `7fac64997164fde64732c80261e56adf66ca14df` supplies interpolation
-  conventions; v0.1 releases supply the model archives. `LICENSE.txt` specifies
-  CC BY-NC 4.0.
+  conventions and checkpoint provenance. `LICENSE.txt` specifies CC BY-NC 4.0.
 - [Original 4D Gaussian Splatting](https://github.com/LogosIntelligenceLab/4d-gaussian-splatting),
   Zeyu Yang et al., ICLR 2024: revision
   `121e360ce23d6e9ca7734072393414c844dfaea2` supplies checkpoint conventions,

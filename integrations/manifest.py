@@ -34,9 +34,8 @@ RAMULATOR = Upstream("ramulator2", "https://github.com/CMU-SAFARI/ramulator2.git
                     "1bb52ceed30cc607a2d328589815eaea976c0224")
 GOLDEN_RATIO = Upstream("Golden-Ratio", "https://github.com/MAdrid1011/Golden-Ratio.git",
                        "437fd7008436e912a035bc6484e2d181c88d840b")
-UPSTREAMS = (EX4DGS, ORIGINAL4DGS, FUSED_SSIM, RAMULATOR, GOLDEN_RATIO)
+UPSTREAMS = (RAMULATOR, GOLDEN_RATIO)
 DATA_URL = "https://github.com/facebookresearch/Neural_3D_Video/releases/download/v1.0/{scene}.zip"
-EX4DGS_URL = "https://github.com/juno181/Ex4DGS/releases/download/v0.1/{scene}.zip"
 
 # Official Mobile-Stage and ENeRF-Outdoor camera/video packages use local inputs.
 # Original archive digests identify the supplied camera/video packages.
@@ -195,7 +194,6 @@ class Workload:
     extension: str
     images: str
     image_prefix: str
-    model_url: str | None
     source: str
     parameters: tuple[tuple[str, object], ...]
 
@@ -211,23 +209,17 @@ class Workload:
     def parameters_for(self, scene: str) -> dict[str, object]:
         return dict(self.parameters) | MODEL_PARAMETERS.get(self.directory, {}).get(scene, {})
 
-    def download_url(self, scene: str) -> str | None:
-        if self.model_url is None or scene in OFFICIAL_SCENE_SOURCES:
-            return None
-        return self.model_url.format(scene=scene)
-
-
 WORKLOADS = {
-    "explicit4d": Workload("explicit4d", "4dgs1k", "pth", "images", "cam00_", None,
+    "explicit4d": Workload("explicit4d", "4dgs1k", "pth", "images", "cam00_",
         "https://papers.neurips.cc/paper_files/paper/2025/hash/6c39d1a7eecfd98570d74bf7efec1be7-Abstract-Conference.html",
         (("retained_fraction", .2), ("keyframe_stride", 20), ("volume_power", .1),
          ("sh_degree", 3), ("sh_degree_t", 2))),
-    "ex4dgs": Workload("ex4dgs", "ex4dgs", "zip", "cam00", "", EX4DGS_URL,
+    "ex4dgs": Workload("ex4dgs", "ex4dgs", "zip", "cam00", "",
         EX4DGS.url, (("release", "v0.1"), ("iterations", 40000), ("duration", 300),
                     ("time_interval", 10), ("time_pad", 2), ("var_pad", 3),
                     ("resolution", 2), ("sh_degree", 3), ("near", 4.0),
                     ("far", 300.0), ("kernel_size", .1))),
-    "anchored": Workload("anchored", "anchored4dgs", "pth", "images", "cam00_", None,
+    "anchored": Workload("anchored", "anchored4dgs", "pth", "images", "cam00_",
         "https://doi.org/10.1145/3757377.3763898",
         (("feature_dim", 32), ("hidden_dim", 32),
          ("bindings", 10), ("tau_t", .05), ("growth_decay", .1),

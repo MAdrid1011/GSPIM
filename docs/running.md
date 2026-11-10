@@ -9,9 +9,10 @@ python -m gspim.demo --prepare
 python -m gspim.demo
 ```
 
-Preparation downloads and preprocesses public inputs and checks supplied models.
-It does not start training. Rendering checks every selected input before loading
-CUDA models. Missing inputs produce a list of paths and preparation instructions.
+Preparation downloads and preprocesses public datasets and checks the supplied
+GSPIM checkpoint bundle. It does not download substitute checkpoints or start
+training. Rendering checks every selected input before loading CUDA models.
+Missing inputs produce a list of paths and preparation instructions.
 
 The first run compiles GPU publication kernels and builds compact PIM traces
 from the selected model and images. Subsequent runs reuse matching traces and

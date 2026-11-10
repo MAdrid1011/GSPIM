@@ -16,9 +16,11 @@ python -m gspim.demo --prepare
 python -m gspim.demo
 ```
 
-Preparation downloads public inputs where available, preprocesses images, and
-checks the supplied 1K and Anchored checkpoints in `checkpoints/`. Model paths and
-sources are described in [workloads](docs/workloads.md). The default run evaluates
+Preparation downloads public datasets where available, preprocesses images, and
+checks the supplied GSPIM checkpoints in `checkpoints/`. Extract the GSPIM
+checkpoint bundle at that path before running; preparation never trains or
+substitutes models. Model paths and formats are described in
+[workloads](docs/workloads.md). The default run evaluates
 all eighteen workload/scene combinations with a ten-frame quick pass and writes
 the result tables and charts to `outputs/`.
 
@@ -40,7 +42,7 @@ the result tables and charts to `outputs/`.
 ## Documentation
 
 - [Setup](docs/setup.md): environment and installation.
-- [Workloads](docs/workloads.md): representations, sources, model formats, and training recipes.
+- [Workloads](docs/workloads.md): representations, checkpoint formats, and model parameters.
 - [Data](docs/data.md): preparation, cameras, pixels, and splits.
 - [Dataflow](docs/dataflow.md): GPU stages, ordering, and batching.
 - [Running](docs/running.md): commands, options, and outputs.
