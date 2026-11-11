@@ -73,6 +73,11 @@ has a 128-request window; field traffic uses twelve bank queues, and each die ha
 physically complete. Completion drains all GPU tasks, memory requests, and staging
 allocations.
 
+Bitmap expansion scans that exceed one staging allocation are divided into ordered
+capacity-bounded passes. The PPIM lane retains its prefix between passes, and the
+final pass carries the descriptors and output sectors. Every physical bitmap read
+and publication dependency remains on the resulting timeline.
+
 Ready consumers prefer the oldest window, then the largest published input
 workload within that window. Producer tasks retain their stage ordering.
 

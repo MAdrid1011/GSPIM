@@ -153,36 +153,40 @@ DATA_SHA256 = {'coffee_martini': {'cam00.mp4': '09cc8b695b78ef13d7e02a3a8a1e7e4f
                 'cam20.mp4': '0a3c26c642437f8780cd7f0d25dea761df6317ef8be50df95777e75bd33287b2',
                 'poses_bounds.npy': 'e436726227fbdcab1095aa326b98cfc32be5da535a9137b9ed157e9a1640e465'}}
 
-# Checkpoint digests for the two official-camera inference inputs.
+# Checkpoint digests and parameters for the selected inference inputs.
 MODEL_SHA256["ex4dgs"].update({
-    "dance3": "9efd284ebac2a10a0ab08f0e82443c78c444c701978cd14ef352491bd2d2d743",
-    "actor1_4": "2b417357d4f4bb7de6e2063d1c231e97df29121b3d747dee1ef8faa3276e70e1",
+    "dance3": "f6cfd51ba9798b4917c2b14c8b90c5df2a652f76fe44fcc4023449ac0233f53f",
+    "actor1_4": "1b3f0704278d790b8221a51d097e3756f4c8bb34f1025ce3e6dbd8e439157615",
 })
 MODEL_SHA256["4dgs1k"].update({
-    "dance3": "1af70cd4d389785131311713baa39ca1382b2b6a97ef747b7554fad20b2e709b",
-    "actor1_4": "3b0d1e70042940e402521dd609b5a5c371b6d68bdc3efb50323d5519b076788f",
+    "dance3": "e319ad97044cf27ee2d160dc135206a99bc3b65621d74a5203874f2304bf8204",
+    "actor1_4": "b827c9bd0483cb3b2db8697f37e2b33e8d4c769cd9b837015e5805e196085e06",
 })
 MODEL_SHA256["anchored4dgs"].update({
-    "dance3": "2851551556dfbfe50ac0b30058235086636c6469eb0c0f36002aeecc06a77e33",
-    "actor1_4": "3c93325c5136c6333b416b209bb923b23a324f5508f0aae0ffb01479961e14c2",
+    "coffee_martini": "8999099376e545b78b7faa033c04f38317990166edd3e751600d472d840defab",
+    "cook_spinach": "21cb84215834eb6d5821486ac62cfd73f15b0d8d75aacddeb2de71428f014368",
+    "sear_steak": "d86b57c87597cd2f2c891d4e867e563658cd92469602b4ab3f7b8b46fb78a1d9",
+    "flame_steak": "13faf386771d19cda24318d4d02f7c73b26c3c3749994383b78425defefbc8e3",
+    "dance3": "5d818302b1132e45bcef80e30052dc1f88b21c09c909a21467c48c670a7c83ca",
+    "actor1_4": "3891ca9f326e1f8b209ff6c07ac749bfeec8b7f356c022c4e8de497e2f1e2b39",
 })
 
 MODEL_PARAMETERS = {
     "4dgs1k": {
-        "dance3": {"source_iteration": 8537, "finetune_steps": 1970, "frame_count": 300},
-        "actor1_4": {"source_iteration": 7495, "finetune_steps": 3265, "frame_count": 200},
+        "dance3": {"source_iteration": 15461, "finetune_steps": 0, "frame_count": 300},
+        "actor1_4": {"source_iteration": 11543, "finetune_steps": 0, "frame_count": 200},
     },
     "ex4dgs": {
-        "dance3": {"release": None, "iterations": 2837, "duration": 300, "resolution": 1, "near": .2, "background": 0},
-        "actor1_4": {"release": None, "iterations": 2720, "duration": 200, "resolution": 1, "near": .2, "background": 0},
+        "dance3": {"release": None, "iterations": 5811, "duration": 300, "resolution": 1, "near": .2, "background": 0},
+        "actor1_4": {"release": None, "iterations": 2473, "duration": 200, "resolution": 1, "near": .2, "background": 0},
     },
     "anchored4dgs": {
-        "coffee_martini": {"training_steps": 658, "source_iteration": 21500, "frame_count": 300},
+        "coffee_martini": {"training_steps": 1748, "source_iteration": 21500, "frame_count": 300},
         "cook_spinach": {"training_steps": 803, "source_iteration": 22500, "frame_count": 300},
-        "sear_steak": {"training_steps": 1459, "source_iteration": 19500, "frame_count": 300},
+        "sear_steak": {"training_steps": 3906, "source_iteration": 19500, "frame_count": 300},
         "flame_steak": {"training_steps": 1110, "source_iteration": 7500, "frame_count": 300},
-        "dance3": {"training_steps": 1939, "source_iteration": 8537, "frame_count": 300},
-        "actor1_4": {"training_steps": 1850, "source_iteration": 7495, "frame_count": 200},
+        "dance3": {"training_steps": 5049, "source_iteration": 15461, "frame_count": 300},
+        "actor1_4": {"training_steps": 3759, "source_iteration": 11543, "frame_count": 200},
     },
 }
 
@@ -231,7 +235,7 @@ WORKLOADS = {
 # Training source and final steps of the supplied compact explicit4d files.
 EXPLICIT4D_STEPS = dict(coffee_martini=(20000, 21500), cook_spinach=(21000, 22500),
                         flame_steak=(6000, 7500), sear_steak=(16500, 19500),
-                        dance3=(8537, 10507), actor1_4=(7495, 10760))
+                        dance3=(15461, 15461), actor1_4=(11543, 11543))
 
 
 def combinations(workload="all", scene="all"):
