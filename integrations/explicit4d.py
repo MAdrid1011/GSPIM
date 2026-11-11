@@ -72,9 +72,9 @@ class Explicit4DCheckpoint:
                 metadata["source_iteration"] <= 0):
             raise ValueError("unsupported 1K checkpoint schema or source training state")
         steps = metadata.get("finetune_steps")
-        if (not isinstance(steps, int) or steps <= 0 or
+        if (not isinstance(steps, int) or steps < 0 or
                 iteration != metadata["source_iteration"] + steps):
-            raise ValueError("complete the recorded masked 1K fine-tuning budget before evaluation")
+            raise ValueError("checkpoint iteration must match its recorded fine-tuning budget")
         if not torch.equal(metadata["keyframes"], torch.arange(0, 301, 20, dtype=torch.int32)):
             raise ValueError("1K keyframes must cover 0..300 at 20-frame intervals")
         count = len(fields[1])

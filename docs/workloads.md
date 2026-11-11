@@ -34,7 +34,7 @@ packages. Their access-controlled source packages are converted to the same
 
 The supplied Dance3 and Actor1_4 models are constructed from native 4D sources
 trained on their calibrated training cameras. Their Ex4DGS keyframe models use
-2837 and 2720 fitting updates, resolution divisor one, near/far planes 0.2/300,
+5811 and 2473 fitting updates, resolution divisor one, near/far planes 0.2/300,
 and a black background. Dance3 covers 300 frames and Actor1_4 covers 200. The manifest's
 `parameters_for(scene)` combines each representation's parameters with the
 values recorded in the selected scene checkpoint.
@@ -73,13 +73,15 @@ inference files. The retained models use these source and final training steps:
 | cook_spinach | 21000 | 22500 |
 | flame_steak | 6000 | 7500 |
 | sear_steak | 16500 | 19500 |
-| dance3 | 8537 | 10507 |
-| actor1_4 | 7495 | 10760 |
+| dance3 | 15461 | 15461 |
+| actor1_4 | 11543 | 11543 |
 
-The Sear source includes continued original 4DGS training before pruning. Masked
-fine-tuning uses batches of four, the original learning-rate schedules, frozen
-population size, black background, and a loss of 0.8 L1 plus 0.2 SSIM. Source
-models follow [original 4DGS](https://github.com/LogosIntelligenceLab/4d-gaussian-splatting)
+The Sear source includes continued original 4DGS training before pruning. The
+four Neural 3D Video models use masked fine-tuning with batches of four, the
+original learning-rate schedules, frozen population size, black background, and
+a loss of 0.8 L1 plus 0.2 SSIM. Dance3 and Actor1_4 use their selected source
+iteration without additional masked updates. Source models follow
+[original 4DGS](https://github.com/LogosIntelligenceLab/4d-gaussian-splatting)
 checkpoint conventions; source provenance is also stored in each compact model.
 
 ## Anchored checkpoint and construction

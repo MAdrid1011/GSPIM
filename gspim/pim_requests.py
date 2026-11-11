@@ -392,16 +392,45 @@ def spatial_requests(capture, spans=4, fabric=4):
                 last_block = int(selected[-1, 7]) // 256
                 bitmap_blocks = list(range(prior_bitmap + 1, last_block + 1))
                 prior_bitmap = max(prior_bitmap, last_block)
-                footprint = (len(selected) + len(bitmap_blocks) + (last - first + raw_per_sector - 1) // raw_per_sector + 1) * 32
                 capacity = 16384
-                if footprint > capacity:
-                    raise ValueError('expansion bitmap span exceeds staging capacity')
                 lane = expansion_base + span * expansion_lanes + first // 128 % lanes
                 tag = lane << 24 | first // 128
                 required = np.unique(np.r_[bitmap_blocks, selected[:, 7] // 256]).astype(np.int64)
                 release = int(publication[required, 1].max()) - origin
+                outputs = (last - first + raw_per_sector - 1) // raw_per_sector
+                fixed_units = len(selected) + outputs + 1
+                capacity_units = capacity // 32
+                if fixed_units > capacity_units:
+                    raise ValueError('expansion descriptors and outputs exceed staging capacity')
+                tail_blocks = capacity_units - fixed_units
+                scan_blocks = bitmap_blocks
+                bitmap_blocks = scan_blocks[-tail_blocks:] if tail_blocks else []
+                allocation_dependency = directory_previous[die][span % 2]
+                # Stream a long bitmap prefix through bounded HCF allocations before
+                # the final descriptor/output pass. The PPIM lane retains its prefix.
+                prefix_blocks = scan_blocks[:len(scan_blocks) - len(bitmap_blocks)]
+                for offset in range(0, len(prefix_blocks), capacity_units - 1):
+                    batch = prefix_blocks[offset:offset + capacity_units - 1]
+                    acquired = len(stream)
+                    stream.append((0, int(np.ceil(release / 1.25)), 7,
+                                   allocation_dependency, (len(batch) + 1) * 32, tag))
+                    begin = len(stream)
+                    for block in batch:
+                        stream.append((address(block % 12, 140000 + span * 8192 +
+                                      block // (12 * 64), block // 12 % 64),
+                                      0, 2, acquired, fabric, tag))
+                    fetched = len(stream)
+                    stream.append((0, 0, 5, acquired, begin, tag))
+                    alu = len(stream)
+                    stream.append((0, 0, 9, fetched, 4 * (8 + len(batch)), tag))
+                    released = len(stream)
+                    stream.append((0, 0, 8, alu, acquired, tag))
+                    allocation_dependency = released
+                footprint = (fixed_units + len(bitmap_blocks)) * 32
+                assert 0 < footprint <= capacity
                 acquired = len(stream)
-                stream.append((0, int(np.ceil(release / 1.25)), 7, directory_previous[die][span % 2], footprint, tag))
+                stream.append((0, int(np.ceil(release / 1.25)), 7,
+                               allocation_dependency, footprint, tag))
                 begin = len(stream)
                 for block in bitmap_blocks:
                     stream.append((address(block % 12, 140000 + span * 8192 + block // (12 * 64), block // 12 % 64), 0, 2, acquired, fabric, tag))
