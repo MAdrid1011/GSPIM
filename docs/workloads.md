@@ -34,7 +34,7 @@ packages. Their access-controlled source packages are converted to the same
 
 The supplied Dance3 and Actor1_4 models are constructed from native 4D sources
 trained on their calibrated training cameras. Their Ex4DGS keyframe models use
-2316 and 2093 fitting updates, resolution divisor one, near/far planes 0.2/300,
+5811 and 2473 fitting updates, resolution divisor one, near/far planes 0.2/300,
 and a black background. Dance3 covers 300 frames and Actor1_4 covers 200. The manifest's
 `parameters_for(scene)` combines each representation's parameters with the
 values recorded in the selected scene checkpoint.
@@ -109,11 +109,8 @@ adjacent primitives form each anchor. Training uses synchronized two-camera
 batches, shared time-conditioned geometry, a 0.8 L1 plus 0.2 SSIM image loss,
 and a 0.001 volume penalty. Decoder inputs and outputs are initialized from a
 32-dimensional low-rank fit of the bound source fields before image training.
-Selected models may then refine decoder fields against the matching source model
-on training-camera poses. Dance3 and Actor1_4 sample the original training poses
-and local interpolation or limited extrapolation between neighboring training
-cameras. The manifest records the source iteration, completed image-training
-updates, and teacher-refinement parameters for every selected scene.
+The manifest records the source iteration and completed image-training updates
+for every scene.
 
 Training checkpoints live in `checkpoints/training/anchored4dgs/`; exports retain
 anchor parameters, decoder weights, static flags, and conservative time intervals
