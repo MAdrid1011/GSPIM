@@ -155,20 +155,20 @@ DATA_SHA256 = {'coffee_martini': {'cam00.mp4': '09cc8b695b78ef13d7e02a3a8a1e7e4f
 
 # Checkpoint digests and parameters for the selected inference inputs.
 MODEL_SHA256["ex4dgs"].update({
-    "dance3": "1af904dbcf92bf3fb47a26d39f5440819808f6256241e903c0f6c34b778c6730",
-    "actor1_4": "c69839f5dbdf001d9de102bf3d92954b7b946a7c94d85af81701c354a58a1c13",
+    "dance3": "f6cfd51ba9798b4917c2b14c8b90c5df2a652f76fe44fcc4023449ac0233f53f",
+    "actor1_4": "1b3f0704278d790b8221a51d097e3756f4c8bb34f1025ce3e6dbd8e439157615",
 })
 MODEL_SHA256["4dgs1k"].update({
     "dance3": "e319ad97044cf27ee2d160dc135206a99bc3b65621d74a5203874f2304bf8204",
     "actor1_4": "b827c9bd0483cb3b2db8697f37e2b33e8d4c769cd9b837015e5805e196085e06",
 })
 MODEL_SHA256["anchored4dgs"].update({
-    "coffee_martini": "298ab43c87093695d991aeac99c97d8a5897a09ba3d631a85e7c7b798e11401c",
+    "coffee_martini": "8999099376e545b78b7faa033c04f38317990166edd3e751600d472d840defab",
     "cook_spinach": "21cb84215834eb6d5821486ac62cfd73f15b0d8d75aacddeb2de71428f014368",
     "sear_steak": "d86b57c87597cd2f2c891d4e867e563658cd92469602b4ab3f7b8b46fb78a1d9",
     "flame_steak": "13faf386771d19cda24318d4d02f7c73b26c3c3749994383b78425defefbc8e3",
-    "dance3": "f4cd06edcdaf7b5e7a61edf3f4199936f605b108bb5bece71bd58b8cbee37e4d",
-    "actor1_4": "a99c826941bffae6760a74ff651332f705ab2c3b752145bbe277a585985b3d25",
+    "dance3": "5d818302b1132e45bcef80e30052dc1f88b21c09c909a21467c48c670a7c83ca",
+    "actor1_4": "3891ca9f326e1f8b209ff6c07ac749bfeec8b7f356c022c4e8de497e2f1e2b39",
 })
 
 MODEL_PARAMETERS = {
@@ -177,29 +177,16 @@ MODEL_PARAMETERS = {
         "actor1_4": {"source_iteration": 11543, "finetune_steps": 0, "frame_count": 200},
     },
     "ex4dgs": {
-        "dance3": {"release": None, "iterations": 2316, "duration": 300,
-                   "resolution": 1, "near": .2, "background": 0,
-                   "training_scope": "training_camera_teacher", "static_fraction": .2},
-        "actor1_4": {"release": None, "iterations": 2093, "duration": 200,
-                     "resolution": 1, "near": .2, "background": 0,
-                     "training_scope": "training_camera_teacher", "static_fraction": .2},
+        "dance3": {"release": None, "iterations": 5811, "duration": 300, "resolution": 1, "near": .2, "background": 0},
+        "actor1_4": {"release": None, "iterations": 2473, "duration": 200, "resolution": 1, "near": .2, "background": 0},
     },
     "anchored4dgs": {
-        "coffee_martini": {"training_steps": 1672, "source_iteration": 21500,
-                            "frame_count": 300, "teacher_steps": 1014,
-                            "teacher_rate_scale": .2,
-                            "teacher_camera_sampling": "training_cameras"},
+        "coffee_martini": {"training_steps": 1748, "source_iteration": 21500, "frame_count": 300},
         "cook_spinach": {"training_steps": 803, "source_iteration": 22500, "frame_count": 300},
         "sear_steak": {"training_steps": 3906, "source_iteration": 19500, "frame_count": 300},
         "flame_steak": {"training_steps": 1110, "source_iteration": 7500, "frame_count": 300},
-        "dance3": {"training_steps": 5016, "source_iteration": 15461,
-                   "frame_count": 300, "teacher_steps": 1612,
-                   "teacher_rate_scale": .05,
-                   "teacher_camera_sampling": "training_camera_local_interpolation_extrapolation"},
-        "actor1_4": {"training_steps": 4736, "source_iteration": 11543,
-                     "frame_count": 200, "teacher_steps": 1518,
-                     "teacher_rate_scale": .05,
-                     "teacher_camera_sampling": "training_camera_local_interpolation_extrapolation"},
+        "dance3": {"training_steps": 5049, "source_iteration": 15461, "frame_count": 300},
+        "actor1_4": {"training_steps": 3759, "source_iteration": 11543, "frame_count": 200},
     },
 }
 
