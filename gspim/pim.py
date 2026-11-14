@@ -207,14 +207,6 @@ def _schedule_destination(trace, library, config, overlap, cache, *, frame_order
     return Path(cache) / 'pim' / 'schedules' / f'{digest.hexdigest()}.npz'
 
 
-def _clone_bundle(bundle):
-    clone = dict(bundle)
-    clone['nodes'] = [dict(node, parents=list(node['parents']), memory=list(node['memory']),
-                                  publications=list(node['publications']))
-                      for node in bundle['nodes']]
-    return clone
-
-
 def _prepare_bundle(bundle):
     release_fields(bundle)
     queues = field_queues(bundle)

@@ -13,6 +13,7 @@ The reproduction environment runs on NVIDIA Jetson AGX Orin 64 GB in MAXN mode.
 | PyTorch | 2.14.0+cu132 |
 | gsplat | 1.5.3 |
 | NumPy / Pillow | 2.0.1 / 12.1.1 |
+| FFmpeg | 5.1.0, Conda-forge |
 | Host compiler | GCC / G++ 13.3 |
 
 Install the Jetson system and CUDA toolkit using
@@ -25,8 +26,8 @@ installation.
 From the repository root:
 
 ```bash
-sudo apt-get install build-essential cmake ninja-build ffmpeg git zstd
-conda create -n gspim --override-channels -c conda-forge python=3.12 pip -y
+sudo apt-get install build-essential cmake ninja-build git zstd
+conda create -n gspim --override-channels -c conda-forge python=3.12 pip ffmpeg=5.1.0 -y
 conda activate gspim
 export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:$PATH"
@@ -38,6 +39,9 @@ The PyTorch CUDA 13.2 index supplies the Python 3.12 aarch64 wheel used by this
 AGX Orin environment. Installing it first lets the project installation use the
 same CUDA-enabled build. NumPy and Pillow retain the image conversion conventions
 in [Data preparation](data.md).
+
+The Conda environment supplies FFmpeg with H.264 and HEVC software decoders for
+input preparation. Run preparation with this environment active.
 
 CMake builds the Ramulator2 backend with C++20. PyTorch and Ninja build the CUDA
 extensions on first use. The renderer includes the CUDA 13 iterator interface;
