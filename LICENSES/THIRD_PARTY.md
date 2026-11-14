@@ -1,6 +1,6 @@
 # Third-party notices
 
-GSPIM code is covered by [LICENSE](LICENSE). Data, weights, upstream sources, and
+GSPIM code is covered by [LICENSE](../LICENSE). Data, weights, upstream sources, and
 installed dependencies retain their respective licenses and notices.
 
 - [Ex4DGS](https://github.com/juno181/Ex4DGS), Junoh Lee et al., NeurIPS 2024:
@@ -37,7 +37,7 @@ installed dependencies retain their respective licenses and notices.
 The preparation routine creates pinned source checkouts under the Git-ignored
 `third_party/` directory. Model construction functions load upstream utilities
 from those checkouts. Checkpoint formats and provenance are described in
-[workloads](docs/workloads.md).
+[workloads](../docs/workloads.md).
 
 ## PyTorch reduction source
 

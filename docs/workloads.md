@@ -113,5 +113,5 @@ at the manifest inference paths. The rendering path reads these compact exports.
 | Original 4DGS | `121e360ce23d6e9ca7734072393414c844dfaea2` | Parameterization, camera math, training utilities and rasterizer |
 | fused-ssim | `a7c48d6dd7ac6dc39a7958c7c4452e0b10418f38` | Differentiable training loss |
 
-[Third-party notices](../THIRD_PARTY_NOTICES.md) describe the applicable licenses
+[Third-party notices](../LICENSES/THIRD_PARTY.md) describe the applicable licenses
 and additional algorithm sources.

@@ -10,4 +10,4 @@ topology. Elaboration supports the default topology; generated RTL, build
 products, and waveforms are ignored by Git.
 
 The hardware source is retained as part of the design. Reproduction uses the
-single [main entry](../README.md#run) and its PIM scheduling model.
+single [main entry](../README.md#evaluation) and its PIM scheduling model.

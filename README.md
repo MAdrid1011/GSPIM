@@ -112,4 +112,4 @@ GSPIM builds on [gsplat](https://github.com/nerfstudio-project/gsplat),
 [original 4DGS](https://github.com/LogosIntelligenceLab/4d-gaussian-splatting),
 [Ex4DGS](https://github.com/juno181/Ex4DGS), and
 [Ramulator2](https://github.com/CMU-SAFARI/ramulator2).
-See [LICENSE](LICENSE) and [Third-party notices](THIRD_PARTY_NOTICES.md).
+See [LICENSE](LICENSE) and [Third-party notices](LICENSES/THIRD_PARTY.md).
