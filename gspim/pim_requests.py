@@ -148,11 +148,14 @@ def field_requests(capture, fabric=4, spans=4):
             selected_ready = len(stream)
             stream.append((0, 0, 9, bitmap_read, 4 * (8 + (hi - lo + 3) // 4), tag))
             read_begin = len(stream)
-            stream.extend(((address(bank, span * 8192 + int(b) // 64, int(b) % 64), 0, 2, selected_ready, fabric, tag) for b in sectors))
+            stream.extend_uniform(address(bank, span * 8192 + sectors // 64, sectors % 64),
+                                  0, 2, selected_ready, fabric, tag)
             fetched = len(stream)
             stream.append((0, 0, 5, selected_ready, read_begin, tag))
             write_begin = len(stream)
-            stream.extend(((address(12 + int(b) // 64 % 4, 20000 + span * 8192 + int(b) // 256, int(b) % 64), 0, 3, fetched, fabric, tag) for b in output_sectors))
+            stream.extend_uniform(address(12 + output_sectors // 64 % 4,
+                20000 + span * 8192 + output_sectors // 256, output_sectors % 64),
+                0, 3, fetched, fabric, tag)
             drained = len(stream)
             stream.append((0, 0, 5, fetched, write_begin, tag))
             stream.append((0, 0, 8, drained, acquired, tag))
@@ -322,17 +325,19 @@ def pack_ids(stream, span, die, keys, mask, tasks, directory, cull, origin, expa
         assert len(r['nodes']) == (cursors[r['segment']] + 7) // 8 + 1
     return (records, done, local_count * 1056, writes)
 
-def spatial_requests(capture, spans=4, fabric=4):
+def spatial_requests(capture, spans=4, fabric=4, *, dies=range(32), field_data=None):
     lanes = 4
     expansion_base = 2 * spans
     expansion_lanes = lanes
     packing_base = expansion_base + spans * expansion_lanes
     if packing_base + 4 * spans > 128:
         raise ValueError('independent die stream IDs exceed the channel namespace')
-    traces, segments, checked, fields = field_requests(capture, fabric, spans=spans)
-    for trace in traces:
+    traces, segments, checked, fields = (field_requests(capture, fabric, spans=spans)
+                                       if field_data is None else field_data)
+    for die in dies:
+        trace = traces[die]
         trace['kind'][trace['kind'] == 4] = 9
-    rows = [RequestRows(v) for v in traces]
+    rows = [RequestRows(v) if die in dies else RequestRows() for die, v in enumerate(traces)]
     origin = field_origin(capture)
     expansions = []
     histograms = []
@@ -357,16 +362,20 @@ def spatial_requests(capture, spans=4, fabric=4):
         packed = raw['tile_ids'].numpy()
         physical_mask = raw['mask'].numpy()
         dram = []
-        for die in range(32):
+        for die in dies:
             stream = rows[die]
             source = desc[headers[die]:headers[die + 1]]
             lengths = (source[:, 2] - source[:, 1]) * (source[:, 4] - source[:, 3])
             prefix = np.r_[0, np.cumsum(lengths, dtype=np.int64)]
             n = int(prefix[-1])
             keys = np.empty(n, np.int32)
-            for r, first, last in zip(source, prefix[:-1], prefix[1:]):
-                g, xmin, xmax, ymin, ymax, original, nx, rank = r
-                keys[first:last] = np.repeat(np.arange(ymin, ymax), xmax - xmin) * raw['tw'] + np.tile(np.arange(xmin, xmax), ymax - ymin)
+            for first in range(0, len(source), 4096):
+                last = min(first + 4096, len(source))
+                owner = np.repeat(np.arange(first, last), lengths[first:last])
+                local = np.arange(prefix[first], prefix[last]) - prefix[owner]
+                width = source[owner, 2] - source[owner, 1]
+                keys[prefix[first]:prefix[last]] = ((source[owner, 3] + local // width)
+                    * raw['tw'] + source[owner, 1] + local % width)
             mask = physical_mask[die, :n]
             live = mask[:, 0].astype(bool)
             expected = mask[live, 1]
@@ -1074,10 +1083,36 @@ def merge_selected_source_requests(results):
 
 
 _PARALLEL_CAPTURE = None
+_PARALLEL_FIELDS = None
 
 
-def _parallel_spatial(spans):
-    return spatial_requests(_PARALLEL_CAPTURE, spans=spans)
+def _parallel_spatial(spans, dies):
+    result = spatial_requests(_PARALLEL_CAPTURE, spans=spans, dies=dies,
+                              field_data=_PARALLEL_FIELDS)
+    streams, expansions, histograms, groups, segments, _, _, storage = result
+    return dies, [streams[die] for die in dies], expansions, histograms, groups, [segments[die] for die in dies], storage
+
+
+def _merge_spatial(results, field_data):
+    streams, segments = [None] * 32, [None] * 32
+    expansions, histograms, groups = [], [], []
+    storage = None
+    for dies, requests, expanded, hist, grouped, packed, sizes in results:
+        for die, request, segment in zip(dies, requests, packed):
+            streams[die], segments[die] = request, segment
+        expansions.extend(expanded)
+        histograms.extend(hist)
+        groups.extend(grouped)
+        if storage is None:
+            storage = sizes
+        else:
+            for row, size in zip(storage, sizes):
+                row['maximum_dram_bytes_per_die'] = max(row['maximum_dram_bytes_per_die'],
+                                                       size['maximum_dram_bytes_per_die'])
+    expansions.sort(key=lambda row: (row['span'], row['die'], row['task']))
+    histograms.sort(key=lambda row: (row['span'], row['die']))
+    groups.sort(key=lambda row: (row['span'], row['die']))
+    return streams, expansions, histograms, groups, segments, field_data[2], field_data[3], storage
 
 
 def _parallel_block():
@@ -1093,26 +1128,30 @@ def _parallel_selected_window(window):
 
 
 def build_requests(capture):
-    global _PARALLEL_CAPTURE
+    global _PARALLEL_CAPTURE, _PARALLEL_FIELDS
     spans = len(capture['segmented_supply'])
     assert 0 < spans and 10 * spans < 256
     selected = capture['decision_supply'].get('workload') in ('explicit4d', 'anchored')
     window_count = len(capture['decision_supply']['windows']) if selected else 1
-    task_count = 2 + window_count
+    spatial_workers = min(4, multiprocessing.cpu_count())
+    die_groups = [list(map(int, group)) for group in np.array_split(np.arange(32), spatial_workers)]
+    task_count = spatial_workers + 1 + window_count
     workers = min(multiprocessing.cpu_count(), task_count)
     print(f'Building PIM requests with {workers} CPU workers', flush=True)
     _PARALLEL_CAPTURE = capture
     try:
+        _PARALLEL_FIELDS = field_requests(capture, spans=spans)
         with ProcessPoolExecutor(max_workers=workers,
                                  mp_context=multiprocessing.get_context('fork')) as executor:
-            hcf_future = executor.submit(_parallel_spatial, spans)
+            hcf_futures = [executor.submit(_parallel_spatial, spans, dies) for dies in die_groups]
             s3_future = executor.submit(_parallel_block)
             if selected:
                 s1_futures = [executor.submit(_parallel_selected_window, window)
                               for window in range(window_count)]
             else:
                 s1_future = executor.submit(_parallel_activity)
-            hcf, expansions, _, _, segments, _, fields, _ = hcf_future.result()
+            hcf, expansions, _, _, segments, _, fields, _ = _merge_spatial(
+                [future.result() for future in hcf_futures], _PARALLEL_FIELDS)
             s3, windows, evidence = s3_future.result()
             if selected:
                 s1, s1_blocks, s1_windows, s1_evidence = merge_selected_source_requests(
@@ -1121,6 +1160,7 @@ def build_requests(capture):
                 s1, s1_blocks, s1_windows, s1_evidence = s1_future.result()
     finally:
         _PARALLEL_CAPTURE = None
+        _PARALLEL_FIELDS = None
     assert s1_evidence['origin_ns'] == evidence['origin_ns']
     hcf_origin = field_origin(capture)
     shift_ns = hcf_origin - evidence['origin_ns']

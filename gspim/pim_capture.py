@@ -2,7 +2,6 @@
 
 from collections import defaultdict
 import hashlib
-from itertools import repeat
 from pathlib import Path
 
 import numpy as np
@@ -356,8 +355,7 @@ def connect_gpu(capture, data, schedule_details=None):
                     graph.edge(publisher, p)
                 if drain:
                     memory(publisher, die, bank_inputs.get((w, die, bank), []))
-                graph.nodes[publisher]['publications'].extend(
-                    zip(repeat(die), indices.tolist()))
+                graph.nodes[publisher]['publications'].extend_requests(die, indices)
 
         s1_indices = np.flatnonzero(stream['ready'][s3_end:]) + s3_end
         if len(s1_indices):
@@ -393,8 +391,7 @@ def connect_gpu(capture, data, schedule_details=None):
                 publisher = graph.add(earliest=release, kind=kind + '_publication')
                 for p in parent:
                     graph.edge(publisher, p)
-                graph.nodes[publisher]['publications'].extend(
-                    zip(repeat(die), indices.tolist()))
+                graph.nodes[publisher]['publications'].extend_requests(die, indices)
     description.update(generation_ctas=sum((t['kind'] == 'generation' for t in ctas)), phase_ctas={kind: sum((t['kind'] == kind for t in ctas)) for kind in phase_ctas}, depth_blocks=sum(map(len, depth)), fused_generation_depth=source.get('fused_generation_depth', False), kernel_join='latest CTA completion plus one measured tail; early CTA slack is retained', window_barrier=False, after_render=False, s3_publication_barrier=False, s3_bank_drain=True, field_publication_barrier=True, generation_input_decomposition=generation_loads is not None, stage_resources_incomplete=[kind for kind in ('projection_finish', 'window_delta', 'crossing', 'sort') if kind not in phase_ctas] + ([] if source.get('fused_generation_depth') else ['depth']) + [kind for kind in ('projection', 'colors') if kind not in phase_ctas], color_reads='per-64-record CTA dispatch releases physical SH reads; native load prefix overlaps their service; all source reads gate measured post-load arithmetic, stores and fences' if color_loads is not None else 'physical completion joined with color service; per-CTA demand not captured')
     return (graph, description)
 
@@ -549,5 +546,5 @@ def build_trace(capture, capture_sha256):
                                   window_decisions=capture['decisions'])
     bundle['builder_sha256'] = {
         name: hashlib.sha256(Path(__file__).with_name(name).read_bytes()).hexdigest()
-        for name in ('pim_capture.py', 'pim_requests.py', 'pim_trace.py')}
+        for name in ('pim_capture.py', 'pim_requests.py', 'pim_trace.py', 'pim_graph.py')}
     return bundle

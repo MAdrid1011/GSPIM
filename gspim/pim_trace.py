@@ -12,6 +12,8 @@ import zipfile
 
 import numpy as np
 
+from .pim_graph import Publications, ResourceTokens, publication_groups
+
 
 SCHEMA = 2
 
@@ -110,6 +112,7 @@ def _pack_nodes(nodes):
     publication_offsets = np.zeros(count + 1, dtype=np.int64)
     publication_die = []
     publication_request = []
+    publication_count = 0
     for index, node in enumerate(nodes):
         earliest[index] = node["earliest"]
         duration[index] = node["duration"]
@@ -124,10 +127,11 @@ def _pack_nodes(nodes):
             memory_values.append(values)
             memory_value_offsets.append(memory_value_offsets[-1] + len(values))
         memory_offsets[index + 1] = len(memory_die)
-        for die, request in node["publications"]:
-            publication_die.append(die)
-            publication_request.append(request)
-        publication_offsets[index + 1] = len(publication_die)
+        for die, requests in publication_groups(node):
+            publication_die.append(np.full(len(requests), die, np.int16))
+            publication_request.append(requests)
+            publication_count += len(requests)
+        publication_offsets[index + 1] = publication_count
     return {
         "node_earliest": earliest,
         "node_duration": duration,
@@ -140,8 +144,8 @@ def _pack_nodes(nodes):
         "node_memory_value_offsets": np.asarray(memory_value_offsets, dtype=np.int64),
         "node_memory_values": (np.concatenate(memory_values) if memory_values else np.empty(0, np.uint64)),
         "node_publication_offsets": publication_offsets,
-        "node_publication_die": np.asarray(publication_die, dtype=np.int16),
-        "node_publication_request": np.asarray(publication_request, dtype=np.uint32),
+        "node_publication_die": np.concatenate(publication_die) if publication_die else np.empty(0, np.int16),
+        "node_publication_request": np.concatenate(publication_request) if publication_request else np.empty(0, np.uint32),
         "kind_names": kinds,
     }
 
@@ -214,10 +218,8 @@ def _unpack_nodes(values):
                 int(memory_die[entry]),
                 memory_values[begin:end].copy(),
             ))
-        publications = [
-            (int(publication_die[offset]), int(publication_request[offset]))
-            for offset in range(publication_offsets[index], publication_offsets[index + 1])
-        ]
+        first, last = publication_offsets[index:index + 2]
+        publications = Publications.from_columns(publication_die[first:last], publication_request[first:last])
         nodes.append({
             "earliest": int(earliest[index]),
             "duration": int(duration[index]),
@@ -372,7 +374,7 @@ def capture_gpu_graph(capture,requests,expansions,segments,fields,spans,
     demands_by_kind={kind:resource_demand(kind)
                      for kind in {task['kind'] for tasks in sm_tasks for task in tasks}}
     for sm,tasks in enumerate(sm_tasks):
-        tokens=[[(None,0)]*n for n in capacity];active=[];occupied=[0]*4
+        tokens=[ResourceTokens(n) for n in capacity];active=[];occupied=[0]*4
         for task in sorted(tasks,key=lambda t:(t['start'],t['end'])):
             demands=demands_by_kind[task['kind']]
             assert all(d<=c for d,c in zip(demands,capacity))
@@ -382,17 +384,14 @@ def capture_gpu_graph(capture,requests,expansions,segments,fields,spans,
                 if old['end']>task['start']:serialized_intervals+=1
                 for kind,indices in enumerate(allocations):
                     occupied[kind]-=old_demands[kind]
-                    for index in indices:tokens[kind][index]=(old['last'],old['end'])
+                    tokens[kind].release(indices,old['last'],old['end'])
             demands=demands_by_kind[task['kind']]
             allocations=[];parents={}
             for kind,demand in enumerate(demands):
-                free=[i for i,value in enumerate(tokens[kind]) if value is not None]
-                assert len(free)>=demand,('captured SM occupancy exceeds hardware',sm,task,kind,occupied,demands)
-                selected=free[:demand];allocations.append(selected)
-                for index in selected:
-                    owner,owner_end=tokens[kind][index]
-                    if owner is not None:parents[owner]=max(parents.get(owner,0),ck(max(0,task['start']-owner_end)))
-                    tokens[kind][index]=None
+                assert capacity[kind]-occupied[kind]>=demand,('captured SM occupancy exceeds hardware',sm,task,kind,occupied,demands)
+                selected,previous=tokens[kind].allocate(demand);allocations.append(selected)
+                for owner,owner_end in previous:
+                    parents[owner]=max(parents.get(owner,0),ck(max(0,task['start']-owner_end)))
                 occupied[kind]+=demand;peaks[kind]=max(peaks[kind],occupied[kind])
             for owner,gap in parents.items():
                 # Tokens enforce availability. The captured idle period is
