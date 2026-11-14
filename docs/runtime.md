@@ -58,12 +58,18 @@ projection, window adjustment, sorting, color publication, culling, and consumer
 tasks. Representation adapters supply explicit or anchored generation fields.
 Fixed CUDA publication kernels compile in the external cache. The recorder
 checks images and window decisions across parallel and serial GPU execution.
+Independent extensions compile with up to three workers. Cache keys include
+source contents, compiler flags, CUDA architecture, and the PyTorch/CUDA versions.
+Captured layouts and source mappings are checked in bounded NumPy batches.
 
 `pim_capture` connects recorded GPU tasks to field publications, input reads,
 block completions, and frame completion events. `pim_requests` translates active
 selection, stability classification, field gathering, and tile packing into
 32-byte physical memory requests. The three representations provide their own
 active fields and generation tasks to the same request and scheduling interface.
+CPU construction partitions spatial requests across independent dies, then merges
+them in span and die order. Publications stay in packed arrays through trace
+serialization and schedule preparation.
 
 `pim_memory` advances paired LPDDR5 dies through Ramulator while GPU tasks execute
 on the same timeline. `pim_schedule` admits GPU tasks according to available SMs,

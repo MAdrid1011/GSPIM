@@ -8,7 +8,7 @@ from pathlib import Path
 RECORDING_ABI = 'gspim-recording-2'
 RECORDING_FILES = (
     'pim_capture.py', 'pim_record.py', 'pim_record_ops.py',
-    'pim_record_models.py', 'pim_requests.py', 'pim_trace.py',
+    'pim_record_models.py', 'pim_requests.py', 'pim_trace.py', 'pim_graph.py',
     'pipeline.py', 'dataflow.py', 'renderer.py', 'renderer.cu',
 )
 

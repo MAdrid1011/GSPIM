@@ -31,8 +31,8 @@ and PyTorch 2.14.0+cu132. With CUDA installed and Conda available, run from the
 repository root:
 
 ```bash
-sudo apt-get install build-essential cmake ninja-build ffmpeg git zstd
-conda create -n gspim --override-channels -c conda-forge python=3.12 pip -y
+sudo apt-get install build-essential cmake ninja-build git zstd
+conda create -n gspim --override-channels -c conda-forge python=3.12 pip ffmpeg=5.1.0 -y
 conda activate gspim
 export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:$PATH"

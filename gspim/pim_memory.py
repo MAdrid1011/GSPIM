@@ -11,6 +11,8 @@ from contextlib import ExitStack
 
 import numpy as np
 
+from .pim_graph import Publications, publication_groups
+
 NONE=0xffffffff
 DTYPE=np.dtype([('address','<u8'),('ready','<u8'),('kind','<u4'),
                 ('depends','<u4'),('cost','<u4'),('tag','<u4')])
@@ -51,7 +53,8 @@ def prepare_backend(upstream, cache):
         commands.extend([
             ['cmake', '-S', str(upstream_build), '-B', str(upstream_build / 'build'),
              '-DCMAKE_BUILD_TYPE=Release', f'-DCMAKE_CXX_COMPILER={compiler[0]}'],
-            ['cmake', '--build', str(upstream_build / 'build'), '--target', 'ramulator', '--parallel', '2'],
+            ['cmake', '--build', str(upstream_build / 'build'), '--target', 'ramulator',
+             '--parallel', str(min(8, os.cpu_count() or 1))],
         ])
     commands.append(
         [*compiler, '-std=c++20', '-O3', '-fPIC', '-shared', '-pthread',
@@ -231,7 +234,7 @@ class FeedbackGraph:
         if earliest<0 or duration<0:raise ValueError('negative GPU time')
         index=len(self.nodes)
         self.nodes.append(dict(earliest=int(earliest),duration=int(duration),kind=kind,
-                               parents=[],memory=list(memory),publications=[]))
+                               parents=[],memory=list(memory),publications=Publications()))
         return index
 
     def edge(self,child,parent,gap=0):
@@ -250,7 +253,7 @@ class FeedbackGraph:
             prepared.append(inputs);positions.append(mapping)
             gates.append(joined['ready']>0)
         count=len(self.nodes);children=[[] for _ in self.nodes]
-        remaining=np.zeros(count,np.int32);release=np.empty(count,np.int64)
+        remaining=[0]*count;release=[0]*count
         groups=[[] for _ in prepared];group_nodes=[[] for _ in prepared]
         publications=[[] for _ in self.nodes]
         for node,task in enumerate(self.nodes):
@@ -265,13 +268,15 @@ class FeedbackGraph:
             for channel,chunks in per_channel.items():
                 groups[channel].append(np.unique(np.concatenate(chunks)))
                 group_nodes[channel].append(node);remaining[node]+=1
-            for die,index in task['publications']:
-                channel=die//2;original=index+(offsets[channel] if die%2 else 0)
-                if not gates[channel][original]:raise ValueError('source publication is missing or duplicated')
+            for die,indices in publication_groups(task):
+                channel=die//2
+                original=indices.astype(np.uint64)+(offsets[channel] if die%2 else 0)
+                if not np.all(gates[channel][original]) or len(np.unique(original)) != len(original):
+                    raise ValueError('source publication is missing or duplicated')
                 gates[channel][original]=False
-                publications[node].append((channel,int(positions[channel][original])-1))
+                publications[node].append((channel,positions[channel][original]-1))
         if any(np.any(gated) for gated in gates):raise ValueError('every external source needs a GPU publisher')
-        ready=[(int(release[node]),node) for node in np.flatnonzero(remaining==0)];heapq.heapify(ready)
+        ready=[(int(release[node]),node) for node in np.flatnonzero(np.asarray(remaining)==0)];heapq.heapify(ready)
         events=[];times=np.full((count,2),-1,np.int64);finished=0;clock=0;steps=0
         ready_groups=[np.asarray(value,np.int64) for value in group_nodes]
         def rounded(value):return ((int(value)+quantum-1)//quantum)*quantum
@@ -295,7 +300,7 @@ class FeedbackGraph:
                         if kind==0:
                             if resources is not None:resources.complete(index,timestamp)
                             for child,gap in children[index]:complete_dependency(child,timestamp+gap)
-                            for channel,request in publications[index]:pending[channel].append(request)
+                            for channel,requests in publications[index]:pending[channel].append(requests)
                             finished+=1
                         else:complete_dependency(index,timestamp)
                     if not ready or ready[0][0]>clock:
@@ -314,7 +319,7 @@ class FeedbackGraph:
                     end=start+self.nodes[node]['duration'];times[node]=start,end
                     heapq.heappush(events,(rounded(end),0,node,end))
                 for session,indices in zip(sessions,pending):
-                    if indices:session.publish_many(np.sort(np.asarray(indices,np.uint64)),clock)
+                    if indices:session.publish_many(np.sort(np.concatenate(indices)),clock)
                 if finished==count:
                     for session in sessions:
                         assert session.advance()==0,'GPU finished with unresolved memory sources'
@@ -347,11 +352,15 @@ class FeedbackGraph:
             for node,task in enumerate(self.nodes):
                 assert times[node,0]>=task['earliest']
                 assert times[node,1]-times[node,0]==task['duration']
-                for parent,gap in task['parents']:assert times[node,0]>=times[parent,1]+gap
+                if len(task['parents']) > 8:
+                    parents=np.asarray(task['parents'],dtype=np.int64)
+                    assert times[node,0]>=np.max(times[parents[:,0],1]+parents[:,1])
+                else:
+                    for parent,gap in task['parents']:assert times[node,0]>=times[parent,1]+gap
                 for die,indices in task['memory']:
                     if len(indices):assert times[node,0]>=int(outputs[die][0][indices].max())
-                for die,request in task['publications']:
-                    assert outputs[die][0][request]>=rounded(times[node,1])
+                for die,indices in publication_groups(task):
+                    assert np.all(outputs[die][0][indices]>=rounded(times[node,1]))
             for channel,session in enumerate(sessions):
                 for kind,key in ((0,'gpu_reads'),(1,'gpu_writes'),(2,'local_reads'),(3,'local_writes')):
                     assert session.stats[key]==np.count_nonzero(prepared[channel]['kind']==kind)

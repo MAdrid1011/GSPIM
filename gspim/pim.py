@@ -198,20 +198,13 @@ def _schedule_destination(trace, library, config, overlap, cache, *, frame_order
     source = Path(__file__)
     mode = str((overlap, frame_order)) if frame_order else str(overlap)
     digest = hashlib.sha256(SCHEDULE_ABI + (trace.sha256 + mode).encode())
-    for path in (source.with_name('pim_memory.py'), source.with_name('pim_schedule.py')):
+    for path in (source.with_name('pim_memory.py'), source.with_name('pim_schedule.py'),
+                 source.with_name('pim_graph.py')):
         tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
         digest.update(ast.dump(tree, include_attributes=False).encode())
     for path in (Path(library), Path(config)):
         digest.update(path.read_bytes())
     return Path(cache) / 'pim' / 'schedules' / f'{digest.hexdigest()}.npz'
-
-
-def _clone_bundle(bundle):
-    clone = dict(bundle)
-    clone['nodes'] = [dict(node, parents=list(node['parents']), memory=list(node['memory']),
-                                  publications=list(node['publications']))
-                      for node in bundle['nodes']]
-    return clone
 
 
 def _prepare_bundle(bundle):

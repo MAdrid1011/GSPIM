@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import torch
 
 from .pipeline import CUDAPipeline
-from .renderer import load_kernel
+from .renderer import load_kernels
 from .pim_record_ops import (ColorFieldBlocks, CompactFields, CrossingShortcut,
     DepthStatistics, HCFNativeSupply, SegmentedAoS, SourceOps, SpatialExpandedTiles,
     SweptGPU, SweptMasks, render_window)
@@ -79,15 +79,26 @@ class GPURecorder:
         self.selection_plans = []
         self.compaction_plans = []
         self.count_checks = []
-        self.pipeline = CUDAPipeline(model, cache)
-        self.native = self.pipeline.renderer.ops
-        def kernel(name):
+        def kernel_name(name):
             if self.shared_windows:
                 if name == 'compact_fields':
                     name = 'compact_fields_anchored'
                 elif name == 'crossings' and int(torch.version.cuda.split('.')[0]) >= 13:
                     name = 'crossings_compact'
-            return load_kernel(name, cache)
+            return name
+        names = ['renderer', 'depth_publication', 'mean', 'projection', 'depth', 'masks',
+                 'source_tiles', 'rectangles', 'spatial_routes', 'segments', 'compact_fields',
+                 'crossings', f'colors_{workload}']
+        if workload == 'ex4dgs':
+            names.extend(('projection_finish', 'ex4dgs_generation', 'ex4dgs_generation_publication'))
+        else:
+            names.append(f'{workload}_generation')
+        if self.shared_windows:
+            names.append('anchored_dataflow')
+        binaries = load_kernels([kernel_name(name) for name in names], cache)
+        kernel = lambda name: binaries[kernel_name(name)]
+        self.pipeline = CUDAPipeline(model, cache)
+        self.native = self.pipeline.renderer.ops
         self.stamps = kernel('depth_publication')
         self.mean = kernel('mean')
         self.projection = kernel('projection')

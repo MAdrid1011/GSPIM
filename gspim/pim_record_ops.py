@@ -259,24 +259,33 @@ class SpatialExpandedTiles(ExpandedTiles):
                 live.append(desc.copy())
                 headers.append(len(desc))
                 cursor = 0
-                for g, xmin, xmax, ymin, ymax, first, nx, rank in desc:
-                    assert rectangles[rank, 0] == g
-                    assert first == 0 + (ymin - rectangles[rank, 4]) * nx + xmin - rectangles[rank, 2]
-                    x = np.tile(np.arange(xmin, xmax), ymax - ymin)
-                    y = np.repeat(np.arange(ymin, ymax), xmax - xmin)
-                    original = first + (y - ymin) * nx + x - xmin + prefix[rank]
-                    count = len(x)
+                expected_flags = expected['flags'].numpy()
+                source_ids = expected['ids'].numpy()
+                for begin in range(0, len(desc), 4096):
+                    batch = desc[begin:begin + 4096]
+                    g, xmin, xmax, ymin, ymax, first, nx, rank = batch.T
+                    assert np.array_equal(rectangles[rank, 0], g)
+                    assert np.array_equal(first, (ymin - rectangles[rank, 4]) * nx
+                                          + xmin - rectangles[rank, 2])
+                    lengths = (xmax - xmin) * (ymax - ymin)
+                    offsets = np.r_[0, np.cumsum(lengths, dtype=np.int64)]
+                    owner = np.repeat(np.arange(len(batch)), lengths)
+                    local = np.arange(offsets[-1]) - offsets[owner]
+                    x = xmin[owner] + local % (xmax - xmin)[owner]
+                    y = ymin[owner] + local // (xmax - xmin)[owner]
+                    original = first[owner] + (y - ymin[owner]) * nx[owner] + x - xmin[owner] + prefix[rank[owner]]
+                    count = len(original)
                     pairs = physical[die, cursor:cursor + count]
-                    expected_pairs = np.column_stack((y * value['tw'] + x, np.full(count, g), original))
-                    assert np.array_equal(pairs[:, :3], expected_pairs[:, :pairs.shape[1]])
+                    assert np.array_equal(pairs[:, 0], y * value['tw'] + x)
+                    assert np.array_equal(pairs[:, 1], g[owner])
+                    if pairs.shape[1] > 2:
+                        assert np.array_equal(pairs[:, 2], original)
                     assert np.array_equal(keys[original], pairs[:, 0]) and np.array_equal(ids[original], pairs[:, 1])
-                    flags = mask[die, cursor:cursor + count]
-                    encoded = flags[:, 0]
-                    flags = np.column_stack((encoded != 0, encoded))
-                    assert np.array_equal(flags[:, 0], expected['flags'].numpy()[original])
-                    expected_ids = expected['ids'].numpy()[original].copy()
-                    expected_ids[expected['flags'].numpy()[original] == 0] = 0
-                    assert np.array_equal(flags[:, 1], expected_ids)
+                    encoded = mask[die, cursor:cursor + count, 0]
+                    assert np.array_equal(encoded != 0, expected_flags[original])
+                    expected_ids = source_ids[original].copy()
+                    expected_ids[expected_flags[original] == 0] = 0
+                    assert np.array_equal(encoded, expected_ids)
                     cursor += count
                 raw_count += cursor
             assert raw_count == len(keys)
@@ -453,28 +462,38 @@ class HCFNativeSupply:
         return values[:2]
 
     def validate_sources(self):
+        import numpy as np
         assert len(self.actual_sources) == len(self.sources)
         for index, (actual, expected) in enumerate(zip(self.actual_sources, self.sources)):
             if 'physical' in actual:
-                physical = actual['physical'].cpu()
-                mask = actual['mask'].cpu()
-                if mask.shape[2] == 1:
-                    encoded = mask[..., 0]
-                    mask = torch.stack(((encoded != 0).int(), encoded), -1)
-                flags = torch.empty_like(expected['flags'])
-                ids = torch.empty_like(expected['ids'])
+                physical = actual['physical'].cpu().numpy()
+                mask = actual['mask'].cpu().numpy()
+                flags = np.empty_like(expected['flags'].numpy())
+                ids = np.empty_like(expected['ids'].numpy())
+                directory = actual['directory'].cpu().numpy().astype(np.int64)
+                raw_indices = actual['raw_indices'].cpu().numpy() if physical.shape[2] == 2 else None
                 offset = 0
-                for die, first, _, count in actual['directory'].cpu().tolist():
-                    indices = physical[die, first:first + count, 2].long() if physical.shape[2] > 2 else actual['raw_indices'][offset:offset + count].cpu().long()
-                    flags[indices] = mask[die, first:first + count, 0]
-                    ids[indices] = mask[die, first:first + count, 1]
-                    offset += count
+                for begin in range(0, len(directory), 4096):
+                    batch = directory[begin:begin + 4096]
+                    counts = batch[:, 3]
+                    borders = np.r_[0, np.cumsum(counts)]
+                    owner = np.repeat(np.arange(len(batch)), counts)
+                    local = np.arange(borders[-1]) - borders[owner]
+                    dies, positions = batch[owner, 0], batch[owner, 1] + local
+                    indices = (physical[dies, positions, 2] if raw_indices is None else
+                               raw_indices[offset:offset + len(owner)]).astype(np.int64, copy=False)
+                    encoded = mask[dies, positions, 0]
+                    flags[indices] = encoded != 0 if mask.shape[2] == 1 else encoded
+                    ids[indices] = encoded if mask.shape[2] == 1 else mask[dies, positions, 1]
+                    offset += len(owner)
                 if physical.shape[2] == 2:
-                    ids[flags == 0] = expected['ids'][flags == 0]
+                    ids[flags == 0] = expected['ids'].numpy()[flags == 0]
                 actual = dict(actual, flags=flags, ids=ids)
             for key in expected:
-                value = actual[key].cpu()
-                assert torch.equal(value, expected[key]), (index, key, int((value != expected[key]).sum()))
+                value = actual[key]
+                value = value.cpu().numpy() if isinstance(value, torch.Tensor) else value
+                reference = expected[key].numpy()
+                assert np.array_equal(value, reference), (index, key, int(np.count_nonzero(value != reference)))
 
     def radix(self, keys, ids, begin, end):
         expected = self.cull_info.get(keys.data_ptr())
@@ -690,31 +709,26 @@ class SegmentedAoS:
     def linked_plan(self, offsets, jobs, encoded, W, width, height):
         import numpy as np
         tw, th = ((width + 15) // 16, (height + 15) // 16)
-        borders = offsets.cpu().tolist()
-        desc = []
-        heads = []
-        links = []
-        for tile in range(tw * th):
-            die = tile % tw // ((tw + 7) // 8) + 8 * (tile // tw // ((th + 3) // 4))
-            lo, hi = borders[tile:tile + 2]
-            for f in range(W):
-                for half in range(2):
-                    task = (tile * W + f) * 2 + half
-                    heads.append(len(desc))
-                    for first in range(lo, hi + 1, 256):
-                        last = min(hi, first + 256)
-                        links.append(len(desc) + 1 if last - first == 256 else -1)
-                        desc.append((first, last, task, die))
-        values = np.array(desc, np.int32)
+        borders = offsets.cpu().numpy().astype(np.int64)
+        lengths = np.diff(borders)
+        per_task = np.repeat(lengths // 256 + 1, W * 2)
+        heads = np.r_[0, np.cumsum(per_task, dtype=np.int64)[:-1]]
+        tasks = np.repeat(np.arange(len(per_task)), per_task)
+        tile = tasks // (W * 2)
+        first = borders[tile] + (np.arange(len(tasks)) - heads[tasks]) * 256
+        last = np.minimum(borders[tile + 1], first + 256)
+        die = tile % tw // ((tw + 7) // 8) + 8 * (tile // tw // ((th + 3) // 4))
+        links = np.where(last - first == 256, np.arange(len(tasks)) + 1, -1)
+        values = np.column_stack((first, last, tasks, die)).astype(np.int32)
         order = np.argsort(values[:, 3], kind='stable')
-        locations = np.empty(len(desc), np.int32)
-        locations[order] = np.arange(len(desc))
+        locations = np.empty(len(values), np.int32)
+        locations[order] = np.arange(len(values))
         die_counts = np.bincount(values[:, 3], minlength=32)
         die_starts = np.r_[0, np.cumsum(die_counts)].astype(np.int32)
         routed = values[order].copy()
         routed[:, 3] = order
         dev = encoded.device
-        tensors = [torch.tensor(v, device=dev, dtype=torch.int32) for v in (heads + links, values, locations, die_starts, routed)]
+        tensors = [torch.tensor(v, device=dev, dtype=torch.int32) for v in (np.concatenate((heads, links)), values, locations, die_starts, routed)]
         return (*tensors, self.binary.emit_ids(encoded))
 
     def batches(self, *args):

@@ -5,6 +5,8 @@ import heapq
 
 import numpy as np
 
+from .pim_graph import publication_groups
+
 
 def release_fields(bundle):
     """Connect each packed field source to its captured producer block."""
@@ -106,9 +108,9 @@ def prepare(bundle):
             continue
         head, tail = cta['first'], cta['last']
         nodes[head]['parents'].append((bundle['spans'][cta['span']]['sort'], 0))
-        memory = defaultdict(set)
+        memory = defaultdict(list)
         for die, indices in nodes[head]['memory']:
-            memory[die].update(map(int, indices))
+            memory[die].append(indices)
         warp_work = []
         for loop in children[head]:
             cursor, sectors = loop, 0
@@ -117,7 +119,7 @@ def prepare(bundle):
                 assert not node['publications']
                 if node['kind'] == 'compose':
                     for die, indices in node['memory']:
-                        memory[die].update(map(int, indices))
+                        memory[die].append(indices)
                         sectors += len(indices)
                 following = children[cursor]
                 assert len(following) == 1
@@ -125,8 +127,8 @@ def prepare(bundle):
             warp_work.append(sectors)
         work[head] = max(warp_work, default=0)
         previous = sum(len(indices) for _, indices in nodes[head]['memory'])
-        nodes[head]['memory'] = [(die, np.asarray(sorted(indices), dtype=np.uint64))
-                                for die, indices in sorted(memory.items())]
+        nodes[head]['memory'] = [(die, np.unique(np.concatenate(chunks)).astype(np.uint64, copy=False))
+                                for die, chunks in sorted(memory.items())]
         additional += sum(len(indices) for _, indices in nodes[head]['memory']) - previous
     bundle['consumer_admission'] = dict(additional_input_fences=additional)
     return work
@@ -282,19 +284,19 @@ def serial_boundaries(bundle):
     for node in nodes:
         if node['kind'] in ('field_source', 'route_source'):
             spans = set()
-            for die, index in node['publications']:
-                lane = int(bundle['requests'][die]['tag'][index]) >> 24
+            for die, indices in publication_groups(node):
+                lanes = np.unique(bundle['requests'][die]['tag'][indices] >> 24)
                 if node['kind'] == 'field_source':
-                    spans.add(lane // 2)
+                    spans.update((lanes // 2).tolist())
                 else:
-                    spans.add((lane - 2 * len(bundle['spans'])) // 4)
+                    spans.update(((lanes - 2 * len(bundle['spans'])) // 4).tolist())
             assert len(spans) == 1
             span = spans.pop()
             if span:
                 node['parents'].append((drains[span - 1], 0))
         elif node['kind'] == 's1_publication':
-            windows = {((int(bundle['requests'][die]['tag'][index]) >> 16) & 255)
-                       for die, index in node['publications']}
+            windows = {int(window) for die, indices in publication_groups(node)
+                       for window in np.unique((bundle['requests'][die]['tag'][indices] >> 16) & 255)}
             assert len(windows) == 1
             window = windows.pop()
             edge = (bundle['windows'][window]['start'], 0)
@@ -362,8 +364,8 @@ def frame_pipeline(bundle):
 
     for node in nodes:
         if node['kind'] == 's1_publication':
-            publications = {((int(bundle['requests'][die]['tag'][index]) >> 16) & 255)
-                            for die, index in node['publications']}
+            publications = {int(window) for die, indices in publication_groups(node)
+                            for window in np.unique((bundle['requests'][die]['tag'][indices] >> 16) & 255)}
             assert len(publications) == 1
             window = publications.pop()
             edge = (windows[window]['start'], 0)
@@ -373,12 +375,12 @@ def frame_pipeline(bundle):
         if node['kind'] not in ('field_source', 'route_source'):
             continue
         spans = set()
-        for die, index in node['publications']:
-            lane = int(bundle['requests'][die]['tag'][index]) >> 24
+        for die, indices in publication_groups(node):
+            lanes = np.unique(bundle['requests'][die]['tag'][indices] >> 24)
             if node['kind'] == 'field_source':
-                spans.add(lane // 2)
+                spans.update((lanes // 2).tolist())
             else:
-                spans.add((lane - 2 * len(bundle['spans'])) // 4)
+                spans.update(((lanes - 2 * len(bundle['spans'])) // 4).tolist())
         assert len(spans) == 1
         window = span_windows[spans.pop()]
         edge = (windows[window]['start'], 0)

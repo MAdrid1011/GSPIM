@@ -20,7 +20,7 @@ def load_kernel(name, cache):
     import torch
 
     folder = Path(__file__).with_name('pim_kernels')
-    source = folder / f'{name}.cu'
+    source = Path(__file__).with_suffix('.cu') if name == 'renderer' else folder / f'{name}.cu'
     inputs = [source]
     includes = [folder]
     if name == 'ex4dgs_generation_publication':
@@ -63,6 +63,24 @@ def load_kernel(name, cache):
     binary = load(module, [str(source)], build_directory=str(directory),
                   extra_cuda_cflags=flags, extra_include_paths=list(map(str, includes)), verbose=False)
     return binary
+
+
+def load_kernels(names, cache):
+    """Prepare independent CUDA extensions with bounded compiler parallelism."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import os
+    from .progress import Progress
+
+    names = list(dict.fromkeys(names))
+    os.environ.setdefault('MAX_JOBS', '2')
+    workers = min(3, max(1, (os.cpu_count() or 1) // 2), len(names))
+    binaries = {}
+    with Progress('CUDA kernels', len(names), completed=lambda: len(binaries)):
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            pending = {executor.submit(load_kernel, name, cache): name for name in names}
+            for future in as_completed(pending):
+                binaries[pending[future]] = future.result()
+    return binaries
 
 
 @dataclass(frozen=True)
@@ -233,7 +251,6 @@ class CUDARenderer:
         import os
 
         import torch
-        from torch.utils.cpp_extension import load
 
         cache = Path(cache).resolve()
         source_root = Path(__file__).resolve().parents[1]
@@ -243,7 +260,7 @@ class CUDARenderer:
         # gsplat also respects this location when its installed wheel needs JIT.
         os.environ["TORCH_EXTENSIONS_DIR"] = str(cache)
         os.environ.setdefault("MAX_JOBS", "2")
-        self.ops = load("gspim_renderer", [str(Path(__file__).with_suffix(".cu"))], extra_cuda_cflags=["-O3"], verbose=False)
+        self.ops = load_kernel('renderer', cache)
         self.torch = torch
         self.cache = cache
         self.generation_model = model if hasattr(model, "motion_rotation") else None
