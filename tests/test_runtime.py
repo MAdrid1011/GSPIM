@@ -102,15 +102,16 @@ class RuntimeTests(unittest.TestCase):
             "nodes": [node("start"), node("consumer"), node("complete-0"),
                       node("complete-1")],
             "windows": [{"width": 1, "start": 0}, {"width": 1, "start": 0}],
-            "frame_events": [{"complete": [2]}, {"complete": [3]}],
+            "frame_events": [{"complete": [1]}, {"complete": [3]}],
             "spans": [{"window": 0}, {"window": 1}],
             "ctas": [{"kind": "decoder", "span": 1, "first": 0},
-                     {"kind": "consumer", "span": 1, "first": 1}],
+                     {"kind": "consumer", "span": 0, "first": 1, "last": 1},
+                     {"kind": "consumer", "span": 1, "first": 3, "last": 3}],
             "requests": [],
         }
         frame_pipeline(bundle)
         self.assertNotIn((4, 0), bundle["nodes"][0]["parents"])
-        self.assertIn((4, 0), bundle["nodes"][1]["parents"])
+        self.assertIn((4, 0), bundle["nodes"][3]["parents"])
 
     def test_window_latency_keeps_early_pim_preparation_outside_ready_time(self):
         import numpy as np
@@ -151,14 +152,17 @@ class RuntimeTests(unittest.TestCase):
             valid.touch()
             os.utime(invalid, (2, 2))
             os.utime(valid, (1, 1))
-            expected = SimpleNamespace(frames=10, metadata={"input_sha256": "inputs"})
+            expected = SimpleNamespace(frames=10, metadata={
+                "input_sha256": "inputs", "recording_sha256": "recording-key",
+            })
 
             def load(path):
                 if path == invalid:
                     raise ValueError("invalid trace")
                 return expected
 
-            with patch("gspim.demo.load_trace", side_effect=load), \
+            with patch("gspim.demo.recording_identity", return_value="recording-key"), \
+                    patch("gspim.demo.load_trace", side_effect=load), \
                     patch("gspim.demo.load_or_build") as build:
                 actual = _load_registered_trace(
                     "ex4dgs", "coffee_martini", 10, "inputs", cache=cache)

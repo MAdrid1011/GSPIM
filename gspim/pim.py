@@ -50,13 +50,22 @@ class ScheduleResult:
     wall_seconds: float
     task_times: np.ndarray
 
-    @property
-    def p95_ms(self):
-        return float(np.percentile(self.latency_ms, 95))
+def _build_trace_file(raw, digest, recording_key, destination):
+    """Convert a CPU capture in a fresh process, away from the CUDA context."""
+    import torch
+    from .pim_capture import build_trace
+    from .pim_trace import write_trace
 
-    @property
-    def p99_ms(self):
-        return float(np.percentile(self.latency_ms, 99))
+    started = time.perf_counter()
+    capture = torch.load(raw, map_location='cpu', weights_only=False)
+    loaded = time.perf_counter()
+    print(f'Loaded CPU capture in {loaded - started:.1f}s', flush=True)
+    bundle = build_trace(capture, digest)
+    built = time.perf_counter()
+    print(f'Built PIM request graph in {built - loaded:.1f}s', flush=True)
+    bundle['recording_sha256'] = recording_key
+    write_trace(bundle, Path(destination))
+    print(f'Wrote compact trace in {time.perf_counter() - built:.1f}s', flush=True)
 
 
 @contextmanager
@@ -107,6 +116,18 @@ def load_trace(path):
     return CapturedTrace(path, trace_digest, bundle)
 
 
+def recording_identity(workload, scene, frames, identity, *, independent=False):
+    """Bind performance traces to their native recording implementation."""
+    import json
+    import torch
+    from .trace_identity import RECORDING_ABI, recording_sources
+
+    context = (RECORDING_ABI, workload, scene, frames, independent, identity,
+               str(torch.__version__), torch.version.cuda, torch.cuda.get_device_name(),
+               torch.cuda.get_device_capability(), recording_sources(workload))
+    return hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
+
+
 def load_or_build(workload, scene, root, frames=10, *, independent=False,
                   model=None, checkpoint=None, images=None, cache=None):
     """Reuse matching traces or record the selected GPU path into the cache."""
@@ -120,18 +141,8 @@ def load_or_build(workload, scene, root, frames=10, *, independent=False,
         raise FileNotFoundError(f'matching PIM inputs are required to build a trace: {path}')
 
     import torch
-    source = Path(__file__).parent
-    key = hashlib.sha256(repr((workload, scene, frames, independent, identity,
-        torch.__version__, torch.version.cuda, torch.cuda.get_device_name(),
-        torch.cuda.get_device_capability())).encode())
-    for name in ('pim_capture.py', 'pim_record.py', 'pim_record_ops.py',
-                 'pim_record_models.py', 'pim_requests.py', 'pim_trace.py',
-                 'pipeline.py', 'dataflow.py', 'renderer.py', 'renderer.cu'):
-        key.update((source / name).read_bytes())
-    key.update((source.parent / 'integrations' / f'{workload}.py').read_bytes())
-    for kernel in sorted((source / 'pim_kernels').iterdir()):
-        key.update(kernel.read_bytes())
-    recording_key = key.hexdigest()
+    recording_key = recording_identity(workload, scene, frames, identity,
+                                       independent=independent)
     if path.is_file():
         trace = load_trace(path)
         if (trace.frames == frames and trace.metadata.get('input_sha256') == identity and
@@ -144,9 +155,7 @@ def load_or_build(workload, scene, root, frames=10, *, independent=False,
 
     import gc
     import tempfile
-    from .pim_capture import build_trace
     from .pim_record import record
-    from .pim_trace import write_trace
 
     folder = Path(cache) / 'pim' / 'traces'
     folder.mkdir(parents=True, exist_ok=True)
@@ -156,6 +165,7 @@ def load_or_build(workload, scene, root, frames=10, *, independent=False,
               f'{"independent" if independent else "Dataflow"})', flush=True)
         capture = record(model, workload, checkpoint, images, cache, frames,
                          independent=independent)
+        print('GPU capture complete; converting on CPU', flush=True)
         gc.collect()
         torch.cuda.empty_cache()
         with tempfile.TemporaryDirectory(prefix='capture-', dir=folder) as temporary:
@@ -163,10 +173,15 @@ def load_or_build(workload, scene, root, frames=10, *, independent=False,
             torch.save(capture, raw)
             with raw.open('rb') as stream:
                 digest = hashlib.file_digest(stream, 'sha256').hexdigest()
-            bundle = build_trace(capture, digest)
-            bundle['recording_sha256'] = recording_key
-            write_trace(bundle, path)
-        del bundle, capture
+            del capture
+            gc.collect()
+            torch.cuda.empty_cache()
+            import multiprocessing
+            from concurrent.futures import ProcessPoolExecutor
+            context = multiprocessing.get_context('spawn')
+            with ProcessPoolExecutor(max_workers=1, mp_context=context) as executor:
+                executor.submit(_build_trace_file, str(raw), digest,
+                                recording_key, str(path)).result()
         gc.collect()
     trace = load_trace(path)
     if (trace.frames != frames or trace.metadata.get('input_sha256') != identity or
@@ -314,33 +329,36 @@ def simulate_dataflow_pair(trace, *, library, config, workers=8, cache=None):
         values[missing] = result
         return tuple(values)
 
-    from concurrent.futures import ThreadPoolExecutor
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor
 
-    overlap_bundle = trace.bundle
-    if overlap_bundle.get('_prepared'):
-        raise ValueError('load a fresh trace before running a second schedule')
-    serial_bundle = _clone_bundle(overlap_bundle)
-    serial_boundaries(serial_bundle)
-    release_fields(overlap_bundle)
-    release_fields(serial_bundle)
-    queues = field_queues(overlap_bundle)
-    overlap_work = _prepare_bundle_after_queues(overlap_bundle)
-    serial_work = _prepare_bundle_after_queues(serial_bundle)
-    backend = MemoryBackend(library, config)
-    started = time.perf_counter()
-    with _controller(queues['lanes'], overlap_bundle['spans']):
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = (
-                executor.submit(_advance_schedule, trace, overlap_bundle,
-                                overlap_work, backend, started, workers),
-                executor.submit(_advance_schedule, trace, serial_bundle,
-                                serial_work, backend, started, workers),
-            )
-            results = tuple(future.result() for future in futures)
-    for destination, result in zip(destinations, results):
-        if destination is not None:
-            _write_schedule(destination, result)
-    return results
+    # Separate interpreters advance both GPU dependency graphs concurrently.
+    # Leave a CPU core per schedule for its Python event loop.
+    per_schedule = min(workers, max(1, (os.cpu_count() or 1) // 2 - 1))
+    context = multiprocessing.get_context('spawn')
+    with ProcessPoolExecutor(max_workers=1, mp_context=context) as executor:
+        future = executor.submit(_simulate_overlap, str(trace.path), str(library),
+                                 str(config), None if cache is None else str(cache),
+                                 per_schedule)
+        serial = simulate(trace, library=library, config=config, workers=per_schedule,
+                          overlap=False, cache=cache)
+        overlap_result = future.result()
+    if cache is None:
+        return overlap_result, serial
+    completed = Path(overlap_result)
+    if completed != destinations[0] or not completed.is_file():
+        raise RuntimeError('overlapping schedule did not produce its cache')
+    return _read_schedule(completed, trace), serial
+
+
+def _simulate_overlap(path, library, config, cache, workers):
+    """Advance the overlapping Dataflow graph in a fresh CPU process."""
+    trace = load_trace(path)
+    result = simulate(trace, library=library, config=config, workers=workers,
+                      overlap=True, cache=cache)
+    if cache is None:
+        return result
+    return str(_schedule_destination(trace, library, config, True, cache))
 
 
 def _simulate_independent(path, library, config, cache, workers):
@@ -362,15 +380,26 @@ def simulate_all(trace, independent, *, library, config, workers=8, cache=None):
                             overlap=True, frame_order=True, cache=cache)
         return pim, serial, pim_only
 
+    shared_destinations = tuple(_schedule_destination(trace, library, config, overlap, cache)
+                                for overlap in (True, False))
+    if all(path.is_file() for path in shared_destinations):
+        # Only the independent schedule needs work; give it the full CPU budget.
+        pim, serial = simulate_dataflow_pair(
+            trace, library=library, config=config, workers=workers, cache=cache)
+        pim_only = simulate(independent, library=library, config=config, workers=workers,
+                            overlap=True, frame_order=True, cache=cache)
+        return pim, serial, pim_only
+
     import multiprocessing
     from concurrent.futures import ProcessPoolExecutor
 
+    per_schedule = min(workers, max(1, (os.cpu_count() or 1) // 3 - 1))
     context = multiprocessing.get_context('spawn')
     with ProcessPoolExecutor(max_workers=1, mp_context=context) as executor:
         future = executor.submit(_simulate_independent, str(independent.path), str(library),
-                                 str(config), str(cache), workers)
+                                 str(config), str(cache), per_schedule)
         pim, serial = simulate_dataflow_pair(
-            trace, library=library, config=config, workers=workers, cache=cache)
+            trace, library=library, config=config, workers=per_schedule, cache=cache)
         completed = Path(future.result())
     if completed != destination or not completed.is_file():
         raise RuntimeError('independent-frame schedule did not produce its cache')

@@ -10,15 +10,13 @@ sources, upstream revisions, and model parameters. Scene names are
 
 | Workload identifier | Representation | Checkpoint path |
 | --- | --- | --- |
-| `explicit4d` | 4DGS-1K: explicit 4D Gaussians and contribution masks | `checkpoints/4dgs1k/<scene>.pth` |
+| `4dgs1k` | 4DGS-1K: explicit 4D Gaussians and contribution masks | `checkpoints/4dgs1k/<scene>.pth` |
 | `ex4dgs` | Static Gaussians and interpolated dynamic keyframes | `checkpoints/ex4dgs/<scene>.zip` |
 | `anchored` | 4D anchors, ten bindings each, and neural decoders | `checkpoints/anchored4dgs/<scene>.pth` |
 
-The GSPIM checkpoint bundle in the project
-[Releases](https://github.com/MAdrid1011/GSPIM/releases) contains the selected
-checkpoint for every row. Extract the bundle at the repository root so that it
-produces the paths above. The manifest records each file's SHA256; `--prepare`
-verifies present files and lists every missing path.
+The four [checkpoint archives](data.md#checkpoints) contain the selected models
+for all eighteen combinations. Extraction produces the paths above, and
+preparation verifies each file against its manifest SHA256.
 
 The Ex4DGS archives contain PLY fields, configuration, and cameras. The adapter
 evaluates each archive directly, using cubic position interpolation and quaternion
@@ -39,7 +37,7 @@ and a black background. Dance3 covers 300 frames and Actor1_4 covers 200. The ma
 `parameters_for(scene)` combines each representation's parameters with the
 values recorded in the selected scene checkpoint.
 
-## Explicit4D checkpoint and construction
+## 4DGS-1K checkpoint and construction
 
 The [4DGS-1K method](https://papers.neurips.cc/paper_files/paper/2025/hash/6c39d1a7eecfd98570d74bf7efec1be7-Abstract-Conference.html)
 uses the original 4DGS parameterization with contribution pruning. The `.pth`
@@ -50,16 +48,11 @@ temporal scales. Optimizer and accumulator slots are `None` in compact files.
 Metadata contains source provenance, retained IDs, sixteen Boolean masks with
 keyframes from 0 through 300 at stride twenty, and the fine-tuning budget.
 
-`gspim.training.explicit4d` contains the construction functions:
-
-- `continue_training(scene, until=None, one_k=False)` continues an original 4DGS
-  source; `one_k=True` performs the masked fine-tuning recorded in its metadata.
-- `prepare_1k(scene, finetune_steps=1500)` accumulates alpha-times-transmittance
-  contributions on training cameras, retains the highest-scoring 20%, and builds
-  keyframe masks. Temporal and spatial time sums are multiplied, with volume
-  exponent 0.1 and the descending 90% reference volume.
-- `export_checkpoint(source, destination)` removes optimizer and sampler state
-  while preserving inference fields and masks.
+The retained training source accumulates alpha-times-transmittance contributions
+on training cameras, retains the highest-scoring 20%, and builds keyframe masks.
+Temporal and spatial time sums are multiplied, with volume exponent 0.1 and the
+descending 90% reference volume. Compact export removes optimizer and sampler
+state while preserving inference fields and masks.
 
 Original source files belong in `checkpoints/training/4dgs/<scene>.pth` and continued
 sources use `<scene>-trained.pth`. Pruned training checkpoints live in
@@ -99,10 +92,6 @@ The compact `.pth` dictionary contains `method`, `iteration`, `training_steps`,
 The loader checks tensor dimensions, finite values, decoder conventions, and the
 recorded training budget.
 
-`gspim.training.anchored` contains `AnchoredModel`, `anchored_inputs(scene)`,
-`train_anchored(scene, until=2000)`,
-`train_anchored_from_source(scene, source, until=None)`, and
-`export_checkpoint(source, destination)`.
 The supplied models initialize binding positions, scales, color features, and
 paired rotations from the matching compact explicit 4D source. Ten spatially
 adjacent primitives form each anchor. Training uses synchronized two-camera

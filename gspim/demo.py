@@ -13,13 +13,14 @@ import zipfile
 
 from integrations.manifest import CACHE, FRAMES, ROOT, SCENE_FRAMES, SCENES, WORKLOADS, combinations
 from .prepare import input_problems, prepare
-from .pim import load_or_build, load_trace, simulate_all
+from .pim import load_or_build, load_trace, recording_identity, simulate_all
 
 DISPLAY_NAMES = {
     "explicit4d": "4DGS-1K",
     "ex4dgs": "Ex4DGS",
     "anchored": "Anchored 4DGS",
 }
+WORKLOAD_NAMES = {"4dgs1k": "explicit4d", "ex4dgs": "ex4dgs", "anchored": "anchored"}
 SCENE_DISPLAY_NAMES = {
     "coffee_martini": "Coffee Martini",
     "cook_spinach": "Cook Spinach",
@@ -37,6 +38,8 @@ PLOT_MODEL_NAMES = {
 
 def _load_registered_trace(workload, scene, frames, identity, *, independent=False, **options):
     """Use a matching prepared trace before recording one into the cache."""
+    recording_key = recording_identity(workload, scene, frames, identity,
+                                       independent=independent)
     suffix = ".frame.trace.npz" if independent else ".trace.npz"
     path = ROOT / "traces" / workload / f"{scene}{suffix}"
     candidates = [(path, True)] if path.is_file() else []
@@ -58,11 +61,21 @@ def _load_registered_trace(workload, scene, frames, identity, *, independent=Fal
             if registered:
                 raise
             continue
-        if trace.frames == frames and trace.metadata.get("input_sha256") == identity:
+        if (trace.frames == frames and trace.metadata.get("input_sha256") == identity and
+                (trace.metadata.get("recording_sha256") == recording_key or
+                 _audited_trace_match(trace, cache, workload, scene, recording_key,
+                                      independent=independent))):
             if independent and any(window["width"] != 1 for window in trace.metadata["windows"]):
                 raise ValueError(f"independent-frame PIM requires single-frame windows: {candidate}")
             return trace
     return load_or_build(workload, scene, ROOT, frames, independent=independent, **options)
+
+
+def _audited_trace_match(trace, cache, workload, scene, recording_key, *, independent):
+    from .trace_cache import audited_compatible
+
+    return audited_compatible(trace, cache, workload, scene, recording_key,
+                              independent=independent)
 
 
 def _validate_trace_images(trace, pipeline) -> None:
@@ -101,37 +114,25 @@ def _write_verification(rows: list[dict], output: Path) -> None:
 def _write_report(rows: list[dict], destination: Path, *, plots: bool = False) -> None:
     """Write measured Performance, Ablation and Quality tables."""
     destination.parent.mkdir(parents=True, exist_ok=True)
-    lines = ["# Results", "", "## Performance", "",
-             "| Model | Dataset | GPU (ms/frame) | GPU + GSPIM Dataflow speedup (ms/frame) | GSPIM speedup (ms/frame) | P95 GPU / Dataflow / GSPIM (ms) | P99 GPU / Dataflow / GSPIM (ms) |",
-             "| --- | --- | ---: | ---: | ---: | ---: | ---: |"]
-    for row in rows:
-        lines.append(
-            f"| {DISPLAY_NAMES[row['workload']]} | {SCENE_DISPLAY_NAMES[row['scene']]} | {row['baseline_ms']/row['frames']:.3f} | {row['gpu_speedup']:.4f}x "
-            f"({row['gpu_dataflow_ms']:.3f} ms) | {row['full_speedup']:.4f}x "
-            f"({row['full_ms']:.3f} ms) | {row['p95_baseline_ms']:.3f} / {row['p95_dataflow_ms']:.3f} / {row['p95_full_ms']:.3f} | "
-            f"{row['p99_baseline_ms']:.3f} / {row['p99_dataflow_ms']:.3f} / {row['p99_full_ms']:.3f} |"
-        )
-    if plots:
-        lines.extend(["", "![Performance](performance.png)"])
-    lines.extend(["", "## Ablation", "",
-                  "| Model | Dataset | GPU | +PIM | +GSPIM Dataflow | +PIM + GSPIM Dataflow | Full GSPIM |",
-                  "| --- | --- | ---: | ---: | ---: | ---: | ---: |"])
-    for row in rows:
-        lines.append(
-            f"| {DISPLAY_NAMES[row['workload']]} | {SCENE_DISPLAY_NAMES[row['scene']]} | 1.0000x | "
-            f"{row['pim_speedup']:.4f}x | {row['gpu_speedup']:.4f}x | "
-            f"{row['pim_dataflow_speedup']:.4f}x | {row['full_speedup']:.4f}x |"
-        )
-    if plots:
-        lines.extend(["", "![Ablation](ablation.png)"])
-    lines.extend(["", "## Quality", "",
-                  "| Model | Dataset | PSNR: Baseline / Dataflow / GSPIM | SSIM: Baseline / Dataflow / GSPIM |",
-                  "| --- | --- | ---: | ---: |"])
+    lines = ["# Results", "", "## Speedup", "",
+             "| Model | Dataset | Dataflow | PIM-only | Serial | Full |",
+             "| --- | --- | ---: | ---: | ---: | ---: |"]
     for row in rows:
         lines.append(
             f"| {DISPLAY_NAMES[row['workload']]} | {SCENE_DISPLAY_NAMES[row['scene']]} | "
-            f"{row['psnr_baseline']:.3f} / {row['psnr_dataflow']:.3f} / {row['psnr_full']:.3f} | "
-            f"{row['ssim_baseline']:.4f} / {row['ssim_dataflow']:.4f} / {row['ssim_full']:.4f} |"
+            f"{row['gpu_speedup']:.4f} | {row['pim_speedup']:.4f} | "
+            f"{row['pim_dataflow_speedup']:.4f} | {row['full_speedup']:.4f} |")
+    if plots:
+        lines.extend(["", "![Performance](performance.png)"])
+        lines.extend(["", "![Ablation](ablation.png)"])
+    lines.extend(["", "## Quality", "",
+                  "| Model | Dataset | Frames | PSNR Base | PSNR Dataflow | PSNR Full | SSIM Base | SSIM Dataflow | SSIM Full |",
+                  "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"])
+    for row in rows:
+        lines.append(
+            f"| {DISPLAY_NAMES[row['workload']]} | {SCENE_DISPLAY_NAMES[row['scene']]} | {row['frames']} | "
+            f"{row['psnr_baseline']:.3f} | {row['psnr_dataflow']:.3f} | {row['psnr_full']:.3f} | "
+            f"{row['ssim_baseline']:.4f} | {row['ssim_dataflow']:.4f} | {row['ssim_full']:.4f} |"
         )
     destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
     if plots:
@@ -175,29 +176,15 @@ def _write_plots(rows: list[dict], output: Path) -> None:
                     }
                     for label in labels:
                         writer.writerow((group, label, major, minor, f"{values[label]:.6f}"))
-        latency_csvs = []
-        for percentile in (95, 99):
-            path = temporary / f"p{percentile}.csv"
-            latency_csvs.append(path)
-            with path.open("w", newline="", encoding="utf-8") as stream:
-                writer = csv.writer(stream)
-                writer.writerow(("group", "label", "major_group", "minor_group", f"Per-frame latency (ms) (P{percentile})"))
-                for row in ordered:
-                    major = SCENE_DISPLAY_NAMES[row["scene"]]
-                    minor = PLOT_MODEL_NAMES[row["workload"]]
-                    group = f"{major} / {DISPLAY_NAMES[row['workload']]}"
-                    for label, suffix in (("GPU", "baseline"), ("GPU + GSPIM Dataflow", "dataflow"), ("GSPIM", "full")):
-                        writer.writerow((group, label, major, minor, row[f"p{percentile}_{suffix}_ms"]))
         common = [sys.executable, str(plotter), "--two_level_xaxis", "--width_pt", "540",
                   "--font_size_pt", "7", "--label_font_size_pt", "8", "--y_min", "0", "--y_ticks", "6",
-                  "--formats", "pdf", "png"]
+                  "--tight_pad_pt", "4", "--formats", "pdf", "png"]
         subprocess.run(common + ["--palette", "#d4cec6", "#9aa6b2", "#2f6b9a",
-                                 "--height_pt", "108",
-                                 "--input", str(performance_csv), "--input_lines",
-                                 *map(str, latency_csvs), "--output", str(output / "performance")],
+                                 "--height_pt", "132",
+                                 "--input", str(performance_csv), "--output", str(output / "performance")],
                        cwd=plotter.parent, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         subprocess.run(common + ["--palette", "#b5bdc5", "#d98e3d", "#5b8e7d", "#6fa3c8", "#2f6b9a",
-                                 "--height_pt", "108", "--input", str(ablation_csv),
+                                 "--height_pt", "132", "--input", str(ablation_csv),
                                  "--output", str(output / "ablation")],
                        cwd=plotter.parent, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
@@ -205,20 +192,17 @@ def _write_plots(rows: list[dict], output: Path) -> None:
 def _run_pair(workload, scene, *, frames, repeats, warmup, checkpoint, images,
               cache, output, library, config):
     import gc
-    import numpy as np
     import torch
     from .pipeline import CUDAPipeline
     from .pim_trace import input_identity
+    from .progress import Progress
 
     torch.set_num_threads(4)
     if not torch.cuda.is_available():
         raise RuntimeError("a CUDA device is required; see docs/setup.md")
     run_frames = min(frames, SCENE_FRAMES.get(scene, frames))
-    if run_frames != frames:
-        print(f"{workload.name}/{scene}: using {run_frames} available frames", flush=True)
     checkpoint = checkpoint or workload.checkpoint(scene)
     images = images or workload.image_directory(scene)
-    print(f"Running {workload.name}/{scene}", flush=True)
     if workload.name == "explicit4d":
         from integrations.explicit4d import Explicit4DCheckpoint
         model = Explicit4DCheckpoint(checkpoint, images)
@@ -231,25 +215,43 @@ def _run_pair(workload, scene, *, frames, repeats, warmup, checkpoint, images,
     trace_options = dict(model=model, checkpoint=checkpoint, images=images, cache=cache)
     trace_frames = min(run_frames, 10)
     identity = input_identity(checkpoint, images, model, trace_frames)
-    trace = _load_registered_trace(workload.name, scene, trace_frames, identity,
-                                   **trace_options)
-    independent = _load_registered_trace(workload.name, scene, trace_frames, identity,
-                                         independent=True, **trace_options)
+    with Progress("Traces", total=2) as progress:
+        trace = _load_registered_trace(workload.name, scene, trace_frames, identity,
+                                       **trace_options)
+        progress.set("Traces", 1, 2)
+        independent = _load_registered_trace(workload.name, scene, trace_frames, identity,
+                                             independent=True, **trace_options)
     for captured in (trace, independent):
         if captured.metadata.get("input_sha256") != identity:
             raise ValueError(
                 f"PIM trace does not match the checkpoint, camera or images: {captured.path}")
         if len(captured.metadata.get("quality", [])) != captured.frames:
             raise ValueError(f"PIM trace has no per-frame quality: {captured.path}")
-    pipeline = CUDAPipeline(model, cache)
-    for captured in (trace, independent):
-        _validate_trace_images(captured, pipeline)
-    measured = pipeline.evaluate(images, output, run_frames, repeats, warmup)
+    with Progress("CUDA"):
+        pipeline = CUDAPipeline(model, cache)
+    with Progress("Trace images", total=2) as progress:
+        for index, captured in enumerate((trace, independent)):
+            _validate_trace_images(captured, pipeline)
+            progress.set("Trace images", index + 1, 2)
+    with Progress("GPU") as progress:
+        measured = pipeline.evaluate(images, output, run_frames, repeats, warmup,
+                                     progress=progress.set)
     baseline_ms = measured["baseline_ms"] / run_frames
     dataflow_ms = measured["dataflow_ms"] / run_frames
     trace_frames = trace.frames
-    pim, serial, pim_only = simulate_all(
-        trace, independent, library=library, config=config, cache=cache)
+    # GPU evaluation is complete; release model storage before CPU simulation.
+    del pipeline, model
+    gc.collect()
+    torch.cuda.empty_cache()
+    from .pim import _schedule_destination
+    destinations = [
+        _schedule_destination(trace, library, config, overlap, cache)
+        for overlap in (True, False)
+    ] + [_schedule_destination(independent, library, config, True, cache, frame_order=True)]
+    with Progress("PIM schedules", total=3,
+                  completed=lambda: sum(path.is_file() for path in destinations)):
+        pim, serial, pim_only = simulate_all(
+            trace, independent, library=library, config=config, cache=cache)
     if serial.physical_counts != pim.physical_counts:
         raise ValueError("overlap changed the physical transaction counts")
     row = {
@@ -259,6 +261,7 @@ def _run_pair(workload, scene, *, frames, repeats, warmup, checkpoint, images,
         "repeats": measured["repeats"],
         "warmup": measured["warmup"],
         "baseline_ms": measured["baseline_ms"],
+        "baseline_implementation": measured["baseline_implementation"],
         "gpu_speedup": baseline_ms / dataflow_ms,
         "gpu_dataflow_ms": dataflow_ms,
         "full_speedup": baseline_ms / (pim.milliseconds / trace_frames),
@@ -271,21 +274,22 @@ def _run_pair(workload, scene, *, frames, repeats, warmup, checkpoint, images,
         "ssim_dataflow": measured["ssim_dataflow"],
         "psnr_full": measured["psnr_dataflow"],
         "ssim_full": measured["ssim_dataflow"],
-        "p95_baseline_ms": float(np.percentile(
-            measured["frame_latency_samples_ms"]["baseline"], 95)),
-        "p99_baseline_ms": float(np.percentile(
-            measured["frame_latency_samples_ms"]["baseline"], 99)),
-        "p95_dataflow_ms": float(np.percentile(
-            measured["frame_latency_samples_ms"]["dataflow"], 95)),
-        "p99_dataflow_ms": float(np.percentile(
-            measured["frame_latency_samples_ms"]["dataflow"], 99)),
-        "p95_full_ms": pim.p95_ms,
-        "p99_full_ms": pim.p99_ms,
         "trace_frames": trace_frames,
     }
+    import json
+    measurements = dict(measured, result=row,
+        traces=[dict(path=str(captured.path), sha256=captured.sha256,
+                     recording_sha256=captured.metadata['recording_sha256'])
+                for captured in (trace, independent)])
+    import hashlib
+    report_key = hashlib.sha256(str(output.resolve()).encode()).hexdigest()[:20]
+    samples = Path(cache) / 'measurements' / report_key
+    samples.mkdir(parents=True, exist_ok=True)
+    (samples / 'measurements.json').write_text(json.dumps(measurements, indent=2), encoding='utf-8')
     _write_report([row], output / "summary.md")
-    print(f"Report: {output / 'summary.md'}", flush=True)
-    del pipeline, model, trace, independent, captured, pim, serial, pim_only, measured
+    print(f"Dataflow {row['gpu_speedup']:.4f}x  PIM-only {row['pim_speedup']:.4f}x  "
+          f"Serial {row['pim_dataflow_speedup']:.4f}x  Full {row['full_speedup']:.4f}x", flush=True)
+    del trace, independent, captured, pim, serial, pim_only, measured
     gc.collect()
     torch.cuda.empty_cache()
     return row
@@ -305,7 +309,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Prepare inputs or run GSPIM CUDA workloads")
     parser.add_argument("--prepare", action="store_true",
                         help="prepare datasets and check supplied GSPIM checkpoints")
-    parser.add_argument("--workload", choices=(*WORKLOADS, "all"), default="all")
+    parser.add_argument("--workload", choices=(*WORKLOAD_NAMES, "all"), default="all")
     parser.add_argument("--scene", choices=(*SCENES, "all"), default="all")
     parser.add_argument("--out", type=Path, help="report directory (default: outputs/<workload>/<scene>)")
     parser.add_argument("--checkpoint", type=Path, help="single-combination model override")
@@ -325,7 +329,7 @@ def main(argv: list[str] | None = None) -> int:
         allowed = ROOT / "outputs"
         if (output == ROOT or ROOT in output.parents) and output != allowed and allowed not in output.parents:
             parser.error("outputs inside the checkout must be under outputs/")
-    pairs = tuple(combinations(args.workload, args.scene))
+    pairs = tuple(combinations(WORKLOAD_NAMES.get(args.workload, args.workload), args.scene))
     if (args.checkpoint or args.images) and len(pairs) != 1:
         parser.error("--checkpoint and --images require a single --workload and --scene")
     if args.prepare and (args.checkpoint or args.images or args.out):
@@ -349,10 +353,14 @@ def main(argv: list[str] | None = None) -> int:
 
     verification: list[dict] = []
     library, config = prepare_backend(ROOT / "third_party/ramulator2", args.cache)
-    for workload, scene in pairs:
+    from .progress import bar
+    for pair_index, (workload, scene) in enumerate(pairs):
+        print(f"\n[{pair_index + 1}/{len(pairs)}] {DISPLAY_NAMES[workload.name]} / "
+              f"{SCENE_DISPLAY_NAMES[scene]}", flush=True)
         output = args.out or ROOT / "outputs"
         if len(pairs) != 1 or args.out is None:
-            output = output / workload.name / scene
+            name = next(key for key, value in WORKLOAD_NAMES.items() if value == workload.name)
+            output = output / name / scene
         keyword = dict(frames=args.frames, repeats=args.repeats, warmup=args.warmup,
                        checkpoint=args.checkpoint, images=args.images, cache=args.cache,
                        output=output, library=library, config=config)
@@ -377,6 +385,8 @@ def main(argv: list[str] | None = None) -> int:
             raise RuntimeError(error or f"{workload.name}/{scene} worker exited with {process.exitcode}")
         verification.append(row)
     _write_verification(verification, args.out or ROOT / "outputs")
+    print(f"\nDone {bar(len(pairs), len(pairs))}\n"
+          f"{(args.out or ROOT / 'outputs') / 'verification.md'}", flush=True)
     return 0
 
 

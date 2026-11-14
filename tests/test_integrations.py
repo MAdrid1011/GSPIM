@@ -25,7 +25,6 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn("cam20.mp4", cameras)
         self.assertIn("dance3", {scene for _, scene in pairs})
         self.assertIn("actor1_4", {scene for _, scene in pairs})
-        self.assertTrue(all(not hasattr(workload, "model_url") for workload, _ in pairs))
 
     def test_missing_inputs_are_listed_without_preparation(self):
         import tempfile

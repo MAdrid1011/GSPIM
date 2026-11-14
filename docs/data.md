@@ -1,5 +1,33 @@
 # Data preparation
 
+## Checkpoints
+
+The [v1.1 release](https://github.com/MAdrid1011/GSPIM/releases/tag/checkpoints-v1.1)
+contains four model archives and `SHA256SUMS`:
+
+| Archive | Models |
+| --- | --- |
+| `gspim-checkpoints-v1.1-4dgs1k-n3v.tar.zst` | 4DGS-1K, four Neural 3D Video scenes |
+| `gspim-checkpoints-v1.1-4dgs1k-official.tar.zst` | 4DGS-1K, Dance3 and Actor1_4 |
+| `gspim-checkpoints-v1.1-ex4dgs.tar.zst` | Ex4DGS, all six scenes |
+| `gspim-checkpoints-v1.1-anchored.tar.zst` | Anchored 4DGS, all six scenes |
+
+Download all four archives and `SHA256SUMS`. With `zstd` installed, extract them
+from the repository root:
+
+```bash
+export GSPIM_DOWNLOADS=/path/to/downloads
+(cd "$GSPIM_DOWNLOADS" && sha256sum --ignore-missing --check SHA256SUMS)
+for archive in "$GSPIM_DOWNLOADS"/gspim-checkpoints-v1.1-*.tar.zst; do
+    tar --zstd -xf "$archive" -C .
+done
+```
+
+Each archive contains a `checkpoints/` prefix. For the
+[external SSD layout](setup.md#external-storage), use `-C "$GSPIM_STORAGE"` so
+extraction writes directly to the SSD. Preparation verifies the resulting 18
+checkpoint files against the workload manifest.
+
 ## Sources and files
 
 The four Neural 3D Video scenes are `coffee_martini`, `cook_spinach`,
@@ -13,9 +41,9 @@ extracts the required members, and verifies their SHA256 values against
 python -m gspim.demo --prepare
 ```
 
-Downloads are staged in `~/.cache/gspim/downloads/`. Completed scene archives are
-removed after extraction. Original videos, camera poses, and processed images
-remain as regular files in the checkout:
+Downloads are staged in `~/.cache/gspim/downloads/`, or `<cache>/downloads/`
+with `--cache`. Completed scene archives are removed after extraction. Original videos, camera poses, and processed images
+remain under `datasets/`, which may be a symlink to external storage:
 
 ```text
 datasets/n3v/<scene>/
@@ -25,12 +53,9 @@ datasets/n3v/<scene>/
   images/cam00_0000.png, ..., camXX_0299.png
 ```
 
-Preparation verifies existing original files and processes up to four camera videos
-concurrently, skipping completed image sequences.
-A repeated invocation fills missing images without replacing complete images.
-Delete a corrupt file before preparing again. Checkpoints are distributed in the
-GSPIM release bundle and verified at their registered paths. A missing checkpoint
-is reported with its required destination; see [workloads](workloads.md).
+Preparation verifies the original files and processes up to four camera videos
+concurrently. Completed image sequences are reused on subsequent invocations.
+Checkpoint formats and model parameters are described in [Workloads](workloads.md).
 
 Obtain Dance3 from [Mobile-Stage](https://docs.google.com/forms/d/e/1FAIpQLSeEbjuTV7w0lfryl-9FPX1VteuPGkbqjDvxXebY02Tm6BMejQ/viewform?usp=sf_link)
 and Actor1_4 from [ENeRF-Outdoor](https://docs.google.com/forms/d/e/1FAIpQLSeFAgcnJEDYEaco4vA2QsD-bM8V8CRFuiR0QWbi_3uXmXtUKg/viewform?usp=sf_link).
@@ -55,7 +80,7 @@ sorted calibration camera: `04` for Dance3 and `00` for Actor1_4. The prepared
 the original camera IDs also remain in `images/`. Training, pruning scores,
 and contribution masks use only the other calibration cameras.
 
-The Ex4DGS adapter reads the camera from the model archive. Explicit4D uses the
+The Ex4DGS adapter reads the camera from the model archive. 4DGS-1K uses the
 pinned original 4DGS normalization: align the average up direction, center the
 camera rays, and scale the mean camera distance to four. Anchored uses the original
 COLMAP coordinate frame. Its initialization matches source camera positions and
@@ -68,7 +93,7 @@ forms have half the original width and height, yielding 1352 by 1014 pixels.
 They preserve separate conversion conventions:
 
 - Ex4DGS held-out images use Pillow bilinear resizing and live in `cam00/`.
-- Explicit4D and Anchored images use the original loader's float divide/multiply
+- 4DGS-1K and Anchored images use the original loader's float divide/multiply
   and byte cast, followed by Pillow's default RGB bicubic resizing. The conversion
   table is `(arange(256) / 255.0 * 255.0).astype(byte).view(uint8)`. All camera
   images live in `images/` with the actual camera ID in each filename.

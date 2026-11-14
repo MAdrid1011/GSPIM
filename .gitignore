@@ -13,11 +13,11 @@ dist/
 *.o
 
 # Prepared inputs, pinned source checkouts and measured outputs
-/datasets/
-/checkpoints/
+/datasets
+/checkpoints
 /third_party/
-/outputs/
-/traces/
+/outputs
+/traces
 
 # Chisel build products, generated RTL and waveforms
 /hardware/generated/

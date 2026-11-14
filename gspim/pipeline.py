@@ -735,16 +735,29 @@ class CUDAPipeline:
         import torch
         from .dataflow import cuda_render_orders
 
-        model = (self.model.select_dataflow(times, first) if hasattr(self.model, 'select_dataflow') else
-                 self.model.select(times, first) if hasattr(self.model, "select") else self.model)
+        if hasattr(self.model, 'anchor_positions') and len(times) > 1:
+            model = (execution.select_anchored(times, first) if execution is not None and
+                     getattr(execution, "shared_windows", False) else
+                     self.renderer.select_anchored_dataflow(self.model, times, first))
+        elif hasattr(self.model, 'temporal_means') and execution is None:
+            model = self.model.select(times, first)
+        else:
+            model = (self.model.select_dataflow(times, first) if hasattr(self.model, 'select_dataflow') else
+                     self.model.select(times, first) if hasattr(self.model, "select") else self.model)
         generated = self.renderer.generate(model, times)
         if hasattr(model, "anchor_positions"):
             # A binding below the compositor's alpha cutoff in every frame
             # cannot affect any pixel. Compact this window's decoded outputs
             # before projection and ordering.
-            active = (generated[2] >= 1 / 255).any(0).nonzero().flatten()
-            generated = tuple(value.index_select(1, active) for value in generated)
-            model.decoded_colors = model.decoded_colors.index_select(0, active)
+            if len(times) > 1:
+                compact = (execution.compact_anchored if execution is not None and
+                           getattr(execution, "shared_windows", False) else
+                           self.renderer.anchored_dataflow_ops.compact)
+                *generated, model.decoded_colors = compact(*generated, model.decoded_colors)
+            else:
+                active = (generated[2] >= 1 / 255).any(0).nonzero().flatten()
+                generated = tuple(value.index_select(1, active) for value in generated)
+                model.decoded_colors = model.decoded_colors.index_select(0, active)
         current = torch.cuda.current_stream(model.xyz.device)
         self.projection_stream.wait_stream(current)
         with torch.cuda.stream(self.projection_stream):
@@ -800,17 +813,24 @@ class CUDAPipeline:
                 for index, (first, last) in enumerate(spans):
                     stream = self.projection_stream if index else current
                     with torch.cuda.stream(stream):
-                        span_selected, _ = self.renderer.ops.visible_order(
-                            selected, projected[0][first:last], depth.new_empty(0))
-                        ordered_depth = depth[first:last, span_selected]
-                        key = ordered_depth.mean(0).contiguous()
-                        if execution is not None:
-                            shared_order = execution.span(self.renderer.ops, key, span_selected)
+                        if (execution is not None and getattr(execution, 'shared_windows', False)
+                                and hasattr(execution, 'span_order')):
+                            local_projection = tuple(value[first:last] if value.numel() else value
+                                                     for value in projected)
+                            shared_order = execution.span_order(selected, local_projection,
+                                                                 depth[first:last])
                         else:
-                            repaired = self.renderer.ops.radix(
-                                key, torch.arange(len(span_selected), dtype=torch.int32,
-                                                  device=selected.device), 0, 32)[1]
-                            shared_order = span_selected[repaired.long()]
+                            span_selected, _ = self.renderer.ops.visible_order(
+                                selected, projected[0][first:last], depth.new_empty(0))
+                            ordered_depth = depth[first:last, span_selected]
+                            key = ordered_depth.mean(0).contiguous()
+                            if execution is not None:
+                                shared_order = execution.span(self.renderer.ops, key, span_selected)
+                            else:
+                                repaired = self.renderer.ops.radix(
+                                    key, torch.arange(len(span_selected), dtype=torch.int32,
+                                                      device=selected.device), 0, 32)[1]
+                                shared_order = span_selected[repaired.long()]
                         local = tuple(value[first:last] if value.numel() else value
                                       for value in projected)
                         span_model = model
@@ -842,8 +862,36 @@ class CUDAPipeline:
 
         model = self.model if model is None else model
         defer_colors = shared_tiles and not hasattr(model, "anchor_positions")
-        if not defer_colors:
+        if not defer_colors and not projected[4].numel():
             projected = (*projected[:4], self.renderer.colors(model, means, projected[0]), projected[5])
+        if shared_tiles:
+            selected = visible_ids
+            if selected is None:
+                selected, _ = self.renderer.ops.visible_order(
+                    stable, projected[0], projected[1].new_empty(0))
+            if hasattr(model, "motion_rotation") and len(means) > 2:
+                # Larger Ex4DGS spans use the native L2-bounded batch planner.
+                # Two-frame spans retain the register-resident tile drain.
+                return self.renderer.ops.shared_window(
+                    means, projected[0], projected[1], projected[3],
+                    projected[4], projected[5], selected, model.sh,
+                    model.camera_position, model.width, model.height,
+                    self.l2_bytes, float(model.config.get("background", 1)),
+                    projected[1].new_empty(0) if output is None else output,
+                    0 if wait_for is None else wait_for.cuda_event, None, None)
+            temporal = hasattr(model, "temporal_means")
+            # Stream bounded tile chunks and keep pixel state in registers,
+            # retaining the preceding span's wait at the compositor boundary.
+            return self.renderer.ops.shared_window_streamed(
+                model.xyz[None] if temporal else means if defer_colors else projected[1].new_empty(0),
+                projected[0], projected[1], projected[3], projected[4], projected[5],
+                selected, model.sh, model.camera_position, model.width, model.height,
+                self.l2_bytes, float(model.config.get("background", 1)),
+                projected[1].new_empty(0) if output is None else output,
+                0 if wait_for is None else wait_for.cuda_event,
+                model.frame_times if temporal else None,
+                model.temporal_means if temporal else None,
+                not hasattr(model, "motion_rotation"))
         unstable_count = orders.shape[1] - len(stable)
         if (hasattr(model, "anchor_positions") and not shared_tiles and
                 0 < unstable_count <= max(1, orders.shape[1] // 100)):
@@ -909,12 +957,17 @@ class CUDAPipeline:
         return image, batches, footprint
 
     def baseline(self, time, first=None):
-        model = self.model.select(time, first) if hasattr(self.model, "select") else self.model
-        generated = self.renderer.generate(model, time)
+        if hasattr(self.model, 'temporal_means'):
+            model = self.model.select(time, first)
+        else:
+            model = self.model.select(time, first) if hasattr(self.model, "select") else self.model
+        if hasattr(model, "baseline_model"):
+            model = model.baseline_model()
+        generated = self.renderer.generate_baseline(model, time)
         return self.renderer.frame(model, self.renderer.project(model, generated))
 
-    def evaluate(self, images, output, frame_count: int, repeats: int = 4, warmup: int = 20) -> dict[str, object]:
-        """Render the selected frames and emit one Markdown summary."""
+    def evaluate(self, images, output, frame_count: int, repeats: int = 4, warmup: int = 20, *, progress=None) -> dict[str, object]:
+        """Measure independent-frame and window rendering over one sequence."""
         from pathlib import Path
 
         import numpy as np
@@ -952,46 +1005,37 @@ class CUDAPipeline:
                 windows.append((start, current))
                 start += current
                 size = min(5, max(2, size + adjustment))
+                if progress:
+                    progress('Windows', start, frame_count)
             for index in range(warmup):
                 start, size = windows[index % len(windows)]
                 for frame in range(start, start + size):
                     self.baseline(times[frame:frame + 1], frame)
                 self.dataflow(times[start:start + size], start)
+                if progress:
+                    progress('Warmup', index + 1, warmup)
             torch.cuda.synchronize()
             durations = {"baseline": [], "dataflow": []}
-            latencies = {name: [] for name in durations}
             maximum_batches = maximum_footprint = 0
             for repeat in range(repeats):
                 modes = tuple(durations) if repeat % 2 == 0 else tuple(reversed(durations))
                 for mode in modes:
-                    records = []
                     begin = torch.cuda.Event(enable_timing=True)
                     begin.record()
                     for start, size in windows:
-                        ready = torch.cuda.Event(enable_timing=True)
-                        ready.record()
-                        completions = []
                         if mode == "baseline":
                             for frame in range(start, start + size):
                                 image = self.baseline(times[frame:frame + 1], frame)
-                                done = torch.cuda.Event(enable_timing=True)
-                                done.record()
-                                completions.append(done)
                         else:
                             image, _, batches, footprint = self.dataflow(times[start:start + size], start)
                             maximum_batches = max(maximum_batches, batches)
                             maximum_footprint = max(maximum_footprint, footprint)
-                            done = torch.cuda.Event(enable_timing=True)
-                            done.record()
-                            # All outputs become available after the batch-major drain.
-                            completions = [done] * size
-                        records.append((ready, completions))
                     end = torch.cuda.Event(enable_timing=True)
                     end.record()
                     end.synchronize()
                     durations[mode].append(begin.elapsed_time(end))
-                    latencies[mode].extend(ready.elapsed_time(done) for ready, events in records for done in events)
-                    print(f"{self.model.name} {mode} repeat {repeat + 1}: {frame_count * 1000 / durations[mode][-1]:.3f} FPS", flush=True)
+                    if progress:
+                        progress('GPU', sum(map(len, durations.values())), 2 * repeats)
             quality = {name: [] for name in durations}
             dataflow_rgb_sha256 = []
             maximum_rgb_error = 0.0
@@ -1013,40 +1057,25 @@ class CUDAPipeline:
                         maximum_rgb_error,
                         float((baseline - dataflow[local]).abs().max().item()),
                     )
+                if progress:
+                    progress('Quality', start + size, frame_count)
         baseline_ms = float(np.mean(durations["baseline"]))
         dataflow_ms = float(np.mean(durations["dataflow"]))
-        p95_baseline = float(np.percentile(latencies["baseline"], 95))
-        p99_baseline = float(np.percentile(latencies["baseline"], 99))
-        p95_dataflow = float(np.percentile(latencies["dataflow"], 95))
-        p99_dataflow = float(np.percentile(latencies["dataflow"], 99))
         baseline_quality = np.mean(quality["baseline"], axis=0)
         dataflow_quality = np.mean(quality["dataflow"], axis=0)
-        speedup = baseline_ms / dataflow_ms
-        lines = [f"# {self.model.name}", "",
-                 f"Frames: {frame_count}; repeats: {repeats}; warmup windows: {warmup}.", "",
-                 "| Path | Speedup | Time (ms/frame) | P95 (ms) | P99 (ms) | PSNR | SSIM |",
-                 "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
-                 f"| baseline | 1.000000x | {baseline_ms/frame_count:.6f} | {p95_baseline:.6f} | {p99_baseline:.6f} | {baseline_quality[0]:.6f} | {baseline_quality[1]:.6f} |",
-                 f"| dataflow | {speedup:.6f}x | {dataflow_ms/frame_count:.6f} | {p95_dataflow:.6f} | {p99_dataflow:.6f} | {dataflow_quality[0]:.6f} | {dataflow_quality[1]:.6f} |"]
+        baseline_implementation = getattr(self.model, "baseline_implementation", "shared CUDA frame inference")
         output.mkdir(parents=True, exist_ok=True)
-        (output / "summary.md").write_text("\n".join(lines) + "\n", encoding="ascii")
         return {
             "workload": getattr(self.model, "workload", "ex4dgs"),
+            "baseline_implementation": baseline_implementation,
             "scene": self.model.name,
             "frames": frame_count,
             "repeats": repeats,
             "warmup": warmup,
             "windows": windows,
             "duration_samples_ms": durations,
-            "frame_latency_samples_ms": latencies,
             "baseline_ms": baseline_ms,
             "dataflow_ms": dataflow_ms,
-            "baseline_fps": float(frame_count * 1000 / baseline_ms),
-            "dataflow_fps": float(frame_count * 1000 / dataflow_ms),
-            "p95_baseline_ms": p95_baseline,
-            "p99_baseline_ms": p99_baseline,
-            "p95_dataflow_ms": p95_dataflow,
-            "p99_dataflow_ms": p99_dataflow,
             "psnr_baseline": float(baseline_quality[0]),
             "ssim_baseline": float(baseline_quality[1]),
             "psnr_dataflow": float(dataflow_quality[0]),

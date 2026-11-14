@@ -307,7 +307,7 @@ def serial_boundaries(bundle):
 
 
 def frame_pipeline(bundle):
-    """Overlap next-frame PIM preparation while keeping GPU frames serial."""
+    """Prefetch one independent frame while preserving ordered GPU consumption."""
     ctas = bundle['ctas']
     staged_publication = any(cta['kind'] in ('decoder', 'projection_finish')
                              for cta in ctas)
@@ -317,12 +317,16 @@ def frame_pipeline(bundle):
     if len(windows) != len(frames) or any(window['width'] != 1 for window in windows):
         raise ValueError('frame pipeline requires one window per frame')
 
+    consumers = [[] for _ in frames]
+    for cta in ctas:
+        if cta['kind'] == 'consumer':
+            consumers[bundle['spans'][cta['span']]['window']].append(cta['last'])
     drains = []
-    for frame in frames:
-        assert frame['complete']
+    for complete in consumers:
+        assert complete
         drains.append(len(nodes))
         nodes.append(dict(earliest=0, duration=0, kind='frame_drain',
-                          parents=[(parent, 0) for parent in frame['complete']],
+                          parents=[(parent, 0) for parent in complete],
                           memory=[], publications=[]))
 
     span_windows = [descriptor['window'] for descriptor in bundle['spans']]
@@ -350,10 +354,11 @@ def frame_pipeline(bundle):
                 if not early and edge not in nodes[cta['first']]['parents']:
                     nodes[cta['first']]['parents'].append(edge)
 
-        for window in range(2, len(windows)):
-            edge = (drains[window - 2], 0)
-            if edge not in nodes[windows[window]['start']]['parents']:
-                nodes[windows[window]['start']]['parents'].append(edge)
+    # Two frame buffers are reused only after all consumers release them.
+    for window in range(2, len(windows)):
+        edge = (drains[window - 2], 0)
+        if edge not in nodes[windows[window]['start']]['parents']:
+            nodes[windows[window]['start']]['parents'].append(edge)
 
     for node in nodes:
         if node['kind'] == 's1_publication':
@@ -364,8 +369,6 @@ def frame_pipeline(bundle):
             edge = (windows[window]['start'], 0)
             if edge not in node['parents']:
                 node['parents'].append(edge)
-            continue
-        if staged_publication:
             continue
         if node['kind'] not in ('field_source', 'route_source'):
             continue
@@ -378,7 +381,6 @@ def frame_pipeline(bundle):
                 spans.add((lane - 2 * len(bundle['spans'])) // 4)
         assert len(spans) == 1
         window = span_windows[spans.pop()]
-        if window >= 2:
-            edge = (drains[window - 2], 0)
-            if edge not in node['parents']:
-                node['parents'].append(edge)
+        edge = (windows[window]['start'], 0)
+        if edge not in node['parents']:
+            node['parents'].append(edge)
