@@ -4,14 +4,14 @@
 
 `CUDAPipeline` compares independent-frame execution with temporal window execution.
 Each call selects active inputs, generates geometry, projects Gaussians, constructs
-render order, and composites pixels. Explicit4D selection unions the masks needed
+render order, and composites pixels. 4DGS-1K selection unions the masks needed
 by the requested frames. Ex4DGS interpolates dynamic keyframes and retains static
 attributes. Its window selection derives conservative temporal support from each
 record's opacity amplitude, envelope centers, and variances. Selected dynamic IDs
 retain their original interpolation keys, and generation fuses camera depth and
 window statistics. Static records remain selected. Anchored selection tests
 conservative anchor intervals before decoding binding positions, covariances,
-opacities, and colors. Explicit4D and Anchored use their selection and decoding
+opacities, and colors. 4DGS-1K and Anchored use their selection and decoding
 functions for both independent-frame and window execution.
 
 The independent-frame path generates and projects one frame at a time, then uses
@@ -19,6 +19,11 @@ gsplat tile sorting and rasterization. The Dataflow path shares generation and
 projection across a window. Anchored windows compact decoded bindings whose opacity
 can reach 1/255 in at least one requested frame before projection. Spherical
 harmonic evaluation can be deferred until visible tile work is known.
+
+The Ex4DGS independent-frame path reconstructs activated attributes and evaluates
+spherical harmonics for each frame. Its Dataflow path reuses static attributes
+and shares dynamic selection and generation within the window. Both paths read
+the same checkpoint and use the same camera and compositing parameters.
 
 ## Windows, stability, and order
 

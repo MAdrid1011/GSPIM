@@ -84,7 +84,11 @@ __global__ void packed_consume(const InputField* fields,
     }
     __syncwarp();
     int total=min(32,hi-base);consumed=base-location*256+total;
+#if defined(GSPIM_COMPACT_UNROLL4)
+    #pragma unroll 4
+#else
     #pragma unroll 2
+#endif
     for(int k=0;k<total;++k) {
       Candidate value=staged[local_warp*32+k];
       unsigned active=__float_as_uint(value.extra.z)&~done_bits;

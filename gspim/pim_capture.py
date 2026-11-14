@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 import hashlib
+from itertools import repeat
 from pathlib import Path
 
 import numpy as np
@@ -320,54 +321,80 @@ def connect_gpu(capture, data, schedule_details=None):
             for block, (_, end) in zip(blocks, row['publication'].numpy()):
                 mapping.setdefault(at(end), []).append(block)
             publication_by_window.append(mapping)
-        publishers = {}
-        for index in np.flatnonzero(stream['ready']):
-            if index < hcf_end:
-                continue
-            row = stream[index]
-            w = int(row['tag']) >> 16 & 255
-            release = int(row['ready'])
-            key = ('s3' if index < s3_end else 's1', w, release)
-            if index >= s3_end and row['kind'] == 0 and (color_loads is not None or generation_loads is not None):
-                launch = int(source_publishers[die][index - s3_end])
-                if launch >= 0:
-                    kind, window, task = publisher_info[launch]
-                    key = (kind, w, task)
-                else:
-                    assert color_loads is None
-                    window = w
-                assert window == w
-            draining = index < s3_end and release != at(source['windows'][w]['window_start'])
-            bank = int(row['address'] // 32 // 64 % 16) if draining else None
-            if draining:
-                key = (*key, die, bank)
-            if key not in publishers:
-                if index < s3_end:
-                    if release == at(source['windows'][w]['window_start']):
-                        parent = [windows[w]]
-                    else:
-                        parent = publication_by_window[w][release]
-                elif row['kind'] == 0:
-                    launch = int(source_publishers[die][index - s3_end])
-                    if launch >= 0:
-                        parent = [launch]
-                        assert release == graph.nodes[launch]['earliest']
-                    elif color_loads is None:
-                        assert release == at(phases[w, 'colors'][0]['start_ns'])
-                        parent = [phase_nodes[w, 'colors_start']]
-                    else:
-                        raise AssertionError('source read has no captured publisher')
-                else:
-                    assert w > 0
-                    assert release == at(phases[w - 1, 'window_delta'][0]['end_ns'])
-                    parent = [phase_nodes[w - 1, 'window_delta']]
-                publisher = graph.add(earliest=release, kind=key[0] + '_publication')
+        def grouped(indices, keys):
+            _, first, inverse = np.unique(keys, return_index=True, return_inverse=True)
+            stable = np.empty(len(first), np.int64)
+            stable[np.argsort(first)] = np.arange(len(first))
+            groups = stable[inverse]
+            order = np.argsort(groups, kind='stable')
+            boundaries = np.r_[0, 1 + np.flatnonzero(
+                groups[order][1:] != groups[order][:-1]), len(order)]
+            return (indices[order[begin:end]]
+                    for begin, end in zip(boundaries[:-1], boundaries[1:]))
+
+        s3_indices = np.flatnonzero(stream['ready'][hcf_end:s3_end]) + hcf_end
+        if len(s3_indices):
+            s3_windows = (stream['tag'][s3_indices] >> 16 & 255).astype(np.uint64)
+            s3_releases = stream['ready'][s3_indices].astype(np.uint64)
+            starts = np.asarray([at(row['window_start'])
+                                 for row in source['windows']], np.uint64)
+            draining = s3_releases != starts[s3_windows]
+            banks = np.where(draining,
+                             stream['address'][s3_indices] // 2048 % 16 + 1, 0)
+            keys = s3_releases << 16 | s3_windows << 8 | banks
+            for indices in grouped(s3_indices, keys):
+                index = int(indices[0])
+                row = stream[index]
+                w = int(row['tag']) >> 16 & 255
+                release = int(row['ready'])
+                drain = release != at(source['windows'][w]['window_start'])
+                bank = int(row['address'] // 2048 % 16) if drain else None
+                parent = ([windows[w]] if not drain
+                          else publication_by_window[w][release])
+                publisher = graph.add(earliest=release, kind='s3_publication')
                 for p in parent:
                     graph.edge(publisher, p)
-                if draining:
+                if drain:
                     memory(publisher, die, bank_inputs.get((w, die, bank), []))
-                publishers[key] = publisher
-            graph.publish(publishers[key], die, int(index))
+                graph.nodes[publisher]['publications'].extend(
+                    zip(repeat(die), indices.tolist()))
+
+        s1_indices = np.flatnonzero(stream['ready'][s3_end:]) + s3_end
+        if len(s1_indices):
+            s1_windows = (stream['tag'][s1_indices] >> 16 & 255).astype(np.uint64)
+            s1_releases = stream['ready'][s1_indices].astype(np.uint64)
+            launches = source_publishers[die][s1_indices - s3_end].astype(np.int64)
+            source_reads = stream['kind'][s1_indices] == 0
+            special = source_reads & (launches >= 0)
+            keys = s1_releases << 8 | s1_windows
+            keys[special] = np.uint64(1 << 63) | launches[special].astype(np.uint64)
+            for indices in grouped(s1_indices, keys):
+                index = int(indices[0])
+                row = stream[index]
+                w = int(row['tag']) >> 16 & 255
+                release = int(row['ready'])
+                launch = (int(source_publishers[die][index - s3_end])
+                          if row['kind'] == 0 else -1)
+                if launch >= 0:
+                    kind, window, _ = publisher_info[launch]
+                    assert window == w and release == graph.nodes[launch]['earliest']
+                    parent = [launch]
+                elif row['kind'] == 0:
+                    if color_loads is not None:
+                        raise AssertionError('source read has no captured publisher')
+                    assert release == at(phases[w, 'colors'][0]['start_ns'])
+                    kind = 's1'
+                    parent = [phase_nodes[w, 'colors_start']]
+                else:
+                    assert (w > 0 and
+                            release == at(phases[w - 1, 'window_delta'][0]['end_ns']))
+                    kind = 's1'
+                    parent = [phase_nodes[w - 1, 'window_delta']]
+                publisher = graph.add(earliest=release, kind=kind + '_publication')
+                for p in parent:
+                    graph.edge(publisher, p)
+                graph.nodes[publisher]['publications'].extend(
+                    zip(repeat(die), indices.tolist()))
     description.update(generation_ctas=sum((t['kind'] == 'generation' for t in ctas)), phase_ctas={kind: sum((t['kind'] == kind for t in ctas)) for kind in phase_ctas}, depth_blocks=sum(map(len, depth)), fused_generation_depth=source.get('fused_generation_depth', False), kernel_join='latest CTA completion plus one measured tail; early CTA slack is retained', window_barrier=False, after_render=False, s3_publication_barrier=False, s3_bank_drain=True, field_publication_barrier=True, generation_input_decomposition=generation_loads is not None, stage_resources_incomplete=[kind for kind in ('projection_finish', 'window_delta', 'crossing', 'sort') if kind not in phase_ctas] + ([] if source.get('fused_generation_depth') else ['depth']) + [kind for kind in ('projection', 'colors') if kind not in phase_ctas], color_reads='per-64-record CTA dispatch releases physical SH reads; native load prefix overlaps their service; all source reads gate measured post-load arithmetic, stores and fences' if color_loads is not None else 'physical completion joined with color service; per-CTA demand not captured')
     return (graph, description)
 

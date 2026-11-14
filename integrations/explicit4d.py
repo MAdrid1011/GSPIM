@@ -64,7 +64,7 @@ class Explicit4DCheckpoint:
         ]):
             payload = torch.load(path, weights_only=True, mmap=True, map_location="cpu")
         if len(payload) != 3:
-            raise ValueError("explicit4d CUDA evaluation requires the pruned 1K model and masks")
+            raise ValueError("4DGS-1K CUDA evaluation requires the pruned 1K model and masks")
         fields, iteration, metadata = payload
         if (len(fields) != 19 or fields[0] != 3 or fields[18] != 2 or
                 not fields[16] or fields[17] is not None or
@@ -126,8 +126,10 @@ class Explicit4DCheckpoint:
         # Keep mask filtering, prefix/select and attribute gathering inside
         # every measured call. Only the representation's keyframe masks persist.
         ids = self.masks[left:right+2].any(0).nonzero().flatten()
-        values = {name: getattr(self, name).index_select(0, ids) for name in (
-            "xyz", "sh", "scales4d", "rotation_l", "rotation_r", "temporal_means", "opacity")}
+        values = {}
+        for name in ("xyz", "sh", "scales4d", "rotation_l", "rotation_r", "temporal_means", "opacity"):
+            source = getattr(self, name)
+            values[name] = source.index_select(0, ids)
         return SimpleNamespace(**values, source_ids=ids, source_count=self.source_count,
             masks=self.masks, frame_times=times, width=self.width, height=self.height,
             view=self.view, intrinsics=self.intrinsics, camera_position=self.camera_position,

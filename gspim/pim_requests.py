@@ -1,6 +1,8 @@
 """Physical PPIM/HCF traffic for captured GPU publications and input demand."""
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor
 import hashlib
+import multiprocessing
 import numpy as np
 from .pim_memory import DTYPE, NONE
 
@@ -652,7 +654,7 @@ def activity_fields(capture, window):
     assert base - 500000 * 2048 < 1 << 27
     return (specs, slots)
 
-def selected_source_requests(capture):
+def selected_source_requests(capture, selected_windows=None):
     from .pim_trace import capture_layout
     layout, _ = capture_layout(capture)
     source = capture['decision_supply']
@@ -667,7 +669,11 @@ def selected_source_requests(capture):
         first = np.r_[0, 1 + np.flatnonzero(np.any(groups[1:] != groups[:-1], axis=1))]
         largest_partition = max(largest_partition, int(np.bincount(ids[first] // 16 % 384, minlength=384).max()))
     destination_bank_extent = largest_partition * 8192
-    for window, (row, inputs) in enumerate(zip(source['windows'], source['window_inputs'])):
+    selected_windows = (range(len(source['windows'])) if selected_windows is None
+                        else selected_windows)
+    for window in selected_windows:
+        row = source['windows'][window]
+        inputs = source['window_inputs'][window]
         ids = inputs['source_ids'].numpy().astype(np.int64)
         count, total = (inputs.get('selection_count', inputs['count']), inputs['source_count'])
         anchored = source['workload'] == 'anchored'
@@ -1020,12 +1026,101 @@ def activity_requests(capture):
              sh_gpu_reads_at_color_phase=True, color_blocks=color_blocks, source_block_records=16))
 
 
+def merge_selected_source_requests(results):
+    """Join independently built windows while preserving stream references."""
+    streams = [[] for _ in range(32)]
+    offsets = [0] * 32
+    blocks, window_meta, checked, color_blocks = [], [], [], []
+    evidence = None
+    for request_streams, result_blocks, result_windows, result_evidence in results:
+        bases = tuple(offsets)
+        for die, stream in enumerate(request_streams):
+            stream = stream.copy()
+            base = bases[die]
+            linked = stream['depends'] != NONE
+            stream['depends'][linked] += base
+            indexed_cost = (stream['kind'] == 5) | (stream['kind'] == 8)
+            stream['cost'][indexed_cost] += base
+            streams[die].append(stream)
+            offsets[die] += len(stream)
+        for block in result_blocks:
+            block = dict(block)
+            base = bases[block['die']]
+            block['done'] += base
+            block['producers'] = [value + base for value in block['producers']]
+            block['input_reads'] = [value + base for value in block['input_reads']]
+            blocks.append(block)
+        for row in result_windows:
+            row = dict(row)
+            base = bases[row['die']]
+            for name in ('done', 'command', 'color_done'):
+                if row[name] != NONE:
+                    row[name] += base
+            window_meta.append(row)
+        for block in result_evidence['color_blocks']:
+            block = dict(block)
+            base = bases[block['die']]
+            block['indices'] = [value + base for value in block['indices']]
+            color_blocks.append(block)
+        checked.extend(result_evidence['windows'])
+        common = {key: value for key, value in result_evidence.items()
+                  if key not in ('windows', 'color_blocks')}
+        if evidence is None:
+            evidence = common
+        else:
+            assert common == evidence
+    evidence = dict(evidence, windows=checked, color_blocks=color_blocks)
+    return ([np.concatenate(parts) for parts in streams], blocks, window_meta, evidence)
+
+
+_PARALLEL_CAPTURE = None
+
+
+def _parallel_spatial(spans):
+    return spatial_requests(_PARALLEL_CAPTURE, spans=spans)
+
+
+def _parallel_block():
+    return block_requests(_PARALLEL_CAPTURE)
+
+
+def _parallel_activity():
+    return activity_requests(_PARALLEL_CAPTURE)
+
+
+def _parallel_selected_window(window):
+    return selected_source_requests(_PARALLEL_CAPTURE, (window,))
+
+
 def build_requests(capture):
+    global _PARALLEL_CAPTURE
     spans = len(capture['segmented_supply'])
     assert 0 < spans and 10 * spans < 256
-    hcf, expansions, _, _, segments, _, fields, _ = spatial_requests(capture, spans=spans)
-    s3, windows, evidence = block_requests(capture)
-    s1, s1_blocks, s1_windows, s1_evidence = activity_requests(capture)
+    selected = capture['decision_supply'].get('workload') in ('explicit4d', 'anchored')
+    window_count = len(capture['decision_supply']['windows']) if selected else 1
+    task_count = 2 + window_count
+    workers = min(multiprocessing.cpu_count(), task_count)
+    print(f'Building PIM requests with {workers} CPU workers', flush=True)
+    _PARALLEL_CAPTURE = capture
+    try:
+        with ProcessPoolExecutor(max_workers=workers,
+                                 mp_context=multiprocessing.get_context('fork')) as executor:
+            hcf_future = executor.submit(_parallel_spatial, spans)
+            s3_future = executor.submit(_parallel_block)
+            if selected:
+                s1_futures = [executor.submit(_parallel_selected_window, window)
+                              for window in range(window_count)]
+            else:
+                s1_future = executor.submit(_parallel_activity)
+            hcf, expansions, _, _, segments, _, fields, _ = hcf_future.result()
+            s3, windows, evidence = s3_future.result()
+            if selected:
+                s1, s1_blocks, s1_windows, s1_evidence = merge_selected_source_requests(
+                    [future.result() for future in s1_futures])
+            else:
+                s1, s1_blocks, s1_windows, s1_evidence = s1_future.result()
+    finally:
+        _PARALLEL_CAPTURE = None
     assert s1_evidence['origin_ns'] == evidence['origin_ns']
     hcf_origin = field_origin(capture)
     shift_ns = hcf_origin - evidence['origin_ns']

@@ -69,11 +69,25 @@ class DeferredTiles:
 class GPURecorder:
     """Publish GPU fields and bind their consumers to the shared Dataflow path."""
 
-    def __init__(self, model, workload, cache):
+    def __init__(self, model, workload, cache, *, shared_windows=True):
         self.model, self.workload = model, workload
+        self.shared_windows = shared_windows and workload == "anchored"
+        self.visible_plans = []
+        self.witness_plans = []
+        self.witness_checks = []
+        self.decision_checks = []
+        self.selection_plans = []
+        self.compaction_plans = []
+        self.count_checks = []
         self.pipeline = CUDAPipeline(model, cache)
         self.native = self.pipeline.renderer.ops
-        kernel = lambda name: load_kernel(name, cache)
+        def kernel(name):
+            if self.shared_windows:
+                if name == 'compact_fields':
+                    name = 'compact_fields_anchored'
+                elif name == 'crossings' and int(torch.version.cuda.split('.')[0]) >= 13:
+                    name = 'crossings_compact'
+            return load_kernel(name, cache)
         self.stamps = kernel('depth_publication')
         self.mean = kernel('mean')
         self.projection = kernel('projection')
@@ -112,6 +126,7 @@ class GPURecorder:
         self.pipeline.renderer.ops = self.tiles
         self.preparation = torch.cuda.Stream(priority=-1)
         self.pipeline.projection_stream = torch.cuda.Stream(priority=-1)
+        self.color_stream = torch.cuda.Stream()
         self.render = torch.cuda.Stream()
         self.lanes = [torch.cuda.Stream() for _ in range(2)]
         self.recording = False
@@ -119,6 +134,40 @@ class GPURecorder:
         self.phase_ctas = {'projection': [], 'window_delta': []}
         if self.finish is not None:
             self.phase_ctas['projection_finish'] = []
+
+    def select_anchored(self, times, first):
+        """Reuse prepared shapes while recomputing and checking GPU selection."""
+        index = self.selection_cursor
+        self.selection_cursor += 1
+        expected = None if self.supply.capture else self.selection_plans[index]
+        model = self.pipeline.renderer.select_anchored_dataflow(
+            self.model, times, first, expected_count=expected)
+        if self.supply.capture:
+            if index == len(self.selection_plans):
+                self.selection_plans.append(len(model.source_anchors))
+            else:
+                self.selection_plans[index] = len(model.source_anchors)
+        else:
+            self.count_checks.append((model.selection_count, expected))
+        return model
+
+    def compact_anchored(self, *args):
+        """Keep selection IDs dynamic and validate the actual compacted count."""
+        index = self.compaction_cursor
+        self.compaction_cursor += 1
+        operations = self.pipeline.renderer.anchored_dataflow_ops
+        if self.supply.capture:
+            result = operations.compact(*args)
+            expected = result[0].shape[1]
+            if index == len(self.compaction_plans):
+                self.compaction_plans.append(expected)
+            else:
+                self.compaction_plans[index] = expected
+            return result
+        expected = self.compaction_plans[index]
+        *result, count = operations.compact_cached(*args, expected)
+        self.count_checks.append((count, expected))
+        return result
 
     def mark(self, kind, function, *args, **kwargs):
         if not self.recording:
@@ -133,16 +182,77 @@ class GPURecorder:
         self.fields.remember(means, projected)
 
     def colors(self, *args):
-        return self.mark('colors', self.fields.colors, *args)
+        if not self.shared_windows or self.supply.capture:
+            return self.mark('colors', self.fields.colors, *args)
+        current = torch.cuda.current_stream()
+        self.color_stream.wait_stream(current)
+        model, means, radii = args
+        projected = self.fields.projections[means.data_ptr()]
+        with torch.cuda.stream(self.color_stream):
+            for value in (*projected, means, model.xyz, model.decoded_colors,
+                          model.camera_position):
+                value.record_stream(self.color_stream)
+            rgb = self.mark('colors', self.fields.colors, *args)
+        self.fields.streams[projected[5].data_ptr()] = self.color_stream
+        return rgb
 
     def publish(self, projected):
         self.consumer.begin_window_fields(projected)
 
     def visible(self, *args):
+        if not self.shared_windows:
+            return self.mark('crossing', self.crossing.visible, *args)
+        stable, radii, depth = args
+        index = self.witness_cursor
+        self.witness_cursor += 1
+        shapes = (stable.shape, radii.shape, depth.shape)
+        if self.supply.capture:
+            result = self.mark('crossing', self.crossing.visible, *args)
+            if index == len(self.witness_plans):
+                self.witness_plans.append((shapes, result[1]))
+            else:
+                self.witness_plans[index] = (shapes, result[1])
+            return result
+        planned = self.witness_plans[index]
+        if (planned == (shapes, True) and len(depth) > 1 and
+                hasattr(self.crossing.binary, 'witness_async')):
+            def probe():
+                flag = self.crossing.binary.witness_async(depth, radii)
+                self.witness_checks.append(flag)
+                self.crossing.single_frame = False
+                return stable.long(), True
+            return self.mark('crossing', probe)
         return self.mark('crossing', self.crossing.visible, *args)
 
     def span(self, *args):
         return self.mark('sort', self.crossing.span, *args)
+
+    def span_order(self, selected, projected, depth):
+        def run():
+            if not len(selected):
+                return selected
+            if not hasattr(self.crossing.binary, 'VisibleSort') or len(depth) not in (2, 3):
+                visible, _ = self.native.visible_order(selected, projected[0], depth.new_empty(0))
+                key = depth[:, visible].mean(0).contiguous()
+                return self.crossing.span(self.tiles, key, visible)
+            index = self.visible_cursor
+            self.visible_cursor += 1
+            shapes = (depth.shape, selected.shape, self.crossing.minimum.shape, projected[0].shape)
+            if index == len(self.visible_plans):
+                self.visible_plans.append(None)
+            if self.visible_plans[index] is None or self.visible_plans[index][0] != shapes:
+                self.visible_plans[index] = (shapes, self.crossing.binary.VisibleSort(
+                    depth, selected, self.crossing.minimum, projected[0]), None)
+            for value in (depth, selected, self.crossing.minimum, projected[0]):
+                value.record_stream(torch.cuda.current_stream())
+            shape, plan, valid = self.visible_plans[index]
+            output = plan.run(depth, selected, self.crossing.minimum, projected[0])
+            if self.supply.capture:
+                valid = int(plan.count())
+                self.visible_plans[index] = (shape, plan, valid)
+            assert valid is not None, 'visible output shape must be established during preparation'
+            return output.narrow(0, 0, valid)
+        return self.mark('sort', run)
 
     def orders(self, means, view, near, far, operators):
         if not isfinite(near) or not isfinite(far) or far <= near:
@@ -167,7 +277,12 @@ class GPURecorder:
         if not self.recording:
             return self.supply.classify(score)
         stable, unstable, expected = self.supply.classes[self.supply.class_cursor]
-        delta, ctas = self.mean.delta(score)
+        if self.shared_windows:
+            average, ctas = self.mean.run(score)
+            self.decision_checks.append((average, expected))
+            delta = expected
+        else:
+            delta, ctas = self.mean.delta(score)
         self.phase_ctas['window_delta'].append(ctas)
         assert delta == expected
         self.supply.class_cursor += 1
@@ -185,6 +300,8 @@ class GPURecorder:
                              output, visible_ids, wait_for, model, self.consumer.begin_fields)
 
     def sequence(self, frames, width, *, prepare=False, lanes=2, slots=4):
+        if self.shared_windows and width > 1:
+            return self._sequence_windowed(frames, width, prepare=prepare, lanes=lanes, slots=slots)
         self.times = torch.arange(frames, device=self.model.xyz.device, dtype=torch.float32)
         if self.adapter is not None:
             self.adapter.reset()
@@ -246,6 +363,84 @@ class GPURecorder:
             torch.cuda.current_stream().wait_event(event)
         return outputs, decisions
 
+    def _sequence_windowed(self, frames, width, *, prepare=False, lanes=2, slots=4):
+        self.times = torch.arange(frames, device=self.model.xyz.device, dtype=torch.float32)
+        if self.adapter is not None:
+            self.adapter.reset()
+        self.consumer.reset()
+        self.visible_cursor = 0
+        self.witness_cursor = 0
+        self.selection_cursor = 0
+        self.compaction_cursor = 0
+        self.fields.reset()
+        self.supply.reset(prepare)
+        origin = torch.cuda.Event()
+        origin.record()
+        self.preparation.wait_event(origin)
+        self.render.wait_event(origin)
+        for lane in self.lanes:
+            lane.wait_event(origin)
+        active = [None] * slots
+        outputs, decisions, submitted = [], [], []
+        pending = []
+        def submit(args):
+            self.consumer.producer_completion = self.supply.cull_completions[self.consumer.plan_cursor]
+            self.consumer.prepare_gpu(args)
+            ready = torch.cuda.Event()
+            ready.record()
+            lane = self.lanes[(index + len(submitted)) % lanes]
+            with torch.cuda.stream(lane):
+                lane.wait_event(ready)
+                for value in args:
+                    if isinstance(value, torch.Tensor) and value.is_cuda:
+                        value.record_stream(lane)
+                self.consumer.batches(*args)
+                done = torch.cuda.Event()
+                done.record()
+                submitted.append(done)
+        def finish(current):
+            with torch.cuda.stream(self.preparation):
+                if not prepare:
+                    for args in current.calls:
+                        submit(args)
+            with torch.cuda.stream(self.render):
+                self.render.wait_event(current.ready)
+                for done in submitted:
+                    self.render.wait_event(done)
+                submitted.clear()
+                current.done = torch.cuda.Event()
+                current.done.record()
+            return current
+        for index, (start, size) in enumerate(_windows(frames, width)):
+            slot = index % slots
+            with torch.cuda.stream(self.preparation):
+                if active[slot] is not None:
+                    self.preparation.wait_event(active[slot].done)
+                if self.recording:
+                    self.starts.append(self.stamps.stamp(self.times))
+                self.tiles.calls = []
+                self.tiles.submit = None
+                result = self.pipeline.dataflow(self.times[start:start + size], start, execution=self)
+                self.tiles.submit = None
+                if prepare:
+                    for args in self.tiles.calls:
+                        self.consumer.prepare(args)
+                ready = torch.cuda.Event()
+                ready.record()
+                current = ReadyWindow(result, self.tiles.calls, ready)
+            pending.append(current)
+            if prepare or len(pending) >= min(2, slots):
+                finish(pending.pop(0))
+            active[slot] = current
+            outputs.append(result[0])
+            decisions.append(result[1])
+        while pending:
+            current = finish(pending.pop(0))
+        torch.cuda.current_stream().wait_event(current.done)
+        for event in self.supply.cull_completions:
+            torch.cuda.current_stream().wait_event(event)
+        return outputs, decisions
+
     def observed_projection(self, model, geometry, defer_colors=False):
         assert defer_colors
         means, covariance, opacity = geometry
@@ -296,6 +491,20 @@ class GPURecorder:
             rows.clear()
 
     def close(self):
+        # Recording inputs are fixed. Reject changed counts or decisions before
+        # exporting any source fields, measurements, or trace image evidence.
+        for actual, expected in self.count_checks:
+            if int(actual) != expected:
+                raise ValueError('runtime selection differs from prepared recording inputs')
+        for average, expected in self.decision_checks:
+            actual = 1 if float(average) >= .98 else -1
+            if actual != expected:
+                raise ValueError('runtime width decision differs from prepared recording inputs')
+        if any(not bool(flag.item()) for flag in self.witness_checks):
+            raise ValueError('runtime crossing differs from prepared recording inputs')
+        for _, plan, expected in self.visible_plans:
+            if expected is not None and expected != int(plan.count()):
+                raise ValueError('runtime visibility differs from prepared recording inputs')
         renderer = self.pipeline.renderer
         renderer.ops = self.native
         self.native.generate = self.original_generate
@@ -328,7 +537,7 @@ def record(model, workload, checkpoint, images, cache, frames=10, *, independent
 
     width = 1 if independent else min(5, frames)
     windows = list(_windows(frames, width))
-    recorder = GPURecorder(model, workload, cache)
+    recorder = GPURecorder(model, workload, cache, shared_windows=not independent)
     pipeline = recorder.pipeline
     times = torch.arange(frames, device=model.xyz.device, dtype=torch.float32)
     try:
@@ -432,6 +641,7 @@ def record(model, workload, checkpoint, images, cache, frames=10, *, independent
             return dict(scene=Path(images).parent.name, frames=frames, window_slots=4, baseline_ms=baseline_ms,
                 durations_ms={'native_shared': dataflow_ms},
                 configuration=dict(first=0, frames=frames, window_width=width, representation=workload,
+                    baseline_implementation=getattr(model, 'baseline_implementation', 'shared CUDA frame inference'),
                     consumer_reserve=0, compact_consumer_fields=True, segment_cta_warps=4),
                 hashes=hashes, shared_gpu_rgb_error=shared_error, scheduling_rgb_error=0.,
                 quality=quality, decisions=decisions, segmented_supply=segment_evidence,

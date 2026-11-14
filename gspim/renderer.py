@@ -27,6 +27,8 @@ def load_kernel(name, cache):
         inputs.append(folder / 'ex4dgs_generation.cu')
     if name == 'mean':
         inputs.append(folder / 'Reduce.cuh')
+    if name == 'compact_fields_anchored':
+        inputs.append(folder / 'compact_fields.cu')
     if name == 'projection':
         import gsplat
         upstream = Path(gsplat.__file__).parent / 'cuda'
@@ -40,6 +42,24 @@ def load_kernel(name, cache):
     module = f'gspim_record_{name}_{digest.hexdigest()[:16]}'
     directory = Path(cache) / 'cuda' / module
     directory.mkdir(parents=True, exist_ok=True)
+    # The name already binds source bytes, precision flags and CUDA/Torch ABI.
+    # Reuse the finished library even when intermediate object files were removed.
+    library = directory / f'{module}.so'
+    if library.is_file():
+        import importlib.util
+        import sys
+
+        if module in sys.modules:
+            return sys.modules[module]
+        try:
+            spec = importlib.util.spec_from_file_location(module, library)
+            binary = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(binary)
+        except ImportError:
+            pass  # Let the normal builder repair an incompatible library.
+        else:
+            sys.modules[module] = binary
+            return binary
     binary = load(module, [str(source)], build_directory=str(directory),
                   extra_cuda_cflags=flags, extra_include_paths=list(map(str, includes)), verbose=False)
     return binary
@@ -225,24 +245,73 @@ class CUDARenderer:
         os.environ.setdefault("MAX_JOBS", "2")
         self.ops = load("gspim_renderer", [str(Path(__file__).with_suffix(".cu"))], extra_cuda_cflags=["-O3"], verbose=False)
         self.torch = torch
+        self.cache = cache
         self.generation_model = model if hasattr(model, "motion_rotation") else None
-        self.generation_parameters = (self.ops.prepare_generation(
+        self._generation_parameters = None
+        self._window_statistics = None
+        self._anchored_dataflow_ops = None
+
+    @property
+    def anchored_dataflow_ops(self):
+        if self._anchored_dataflow_ops is None:
+            self._anchored_dataflow_ops = load_kernel('anchored_dataflow', self.cache)
+        return self._anchored_dataflow_ops
+
+    def select_anchored_dataflow(self, source, times, first=None, *, expected_count=None):
+        """Select a window in stable source order and gather its fields together."""
+        from copy import copy
+
+        first = int(times[0]) if first is None else first
+        if first < 0 or first + len(times) > source.duration or not 2 <= len(times) <= 5:
+            raise ValueError('Anchored Dataflow requires two to five in-range frames')
+        arguments = (source.intervals, times, source.anchor_positions, source.anchor_offsets,
+                     source.anchor_features, source.anchor_log_scales, source.anchor_static)
+        if expected_count is None:
+            ids, anchors, offsets, features, scales, static = self.anchored_dataflow_ops.select(*arguments)
+            actual_count = None
+        else:
+            ids, anchors, offsets, features, scales, static, actual_count = self.anchored_dataflow_ops.select_cached(
+                *arguments, expected_count)
+        selected = copy(source)
+        selected.source_anchors = ids
+        selected.selection_count = actual_count
+        selected.anchor_positions, selected.anchor_offsets = anchors, offsets
+        selected.anchor_features, selected.anchor_log_scales = features, scales
+        selected.anchor_static, selected.xyz = static, anchors[:, :3]
+        return selected
+
+    def _prepare_dataflow_generation(self):
+        """Initialize Ex4DGS technique state only when that path is used."""
+        if self.generation_model is None or self._generation_parameters is not None:
+            return
+        from .pim_record_ops import DepthStatistics
+
+        model = self.generation_model
+        parameters = self.ops.prepare_generation(
             model.motion, model.motion_rotation, model.opacity_variance, model.interval,
             float(model.config["var_pad"]),
-        ) if self.generation_model is not None else None)
-        self.window_statistics = None
-        if self.generation_parameters is not None:
-            from .pim_record_ops import DepthStatistics
-            self.window_statistics = DepthStatistics(load_kernel('depth', cache), self.ops)
-            self.window_statistics.generation_binary = load_kernel('ex4dgs_generation', cache)
-            self.window_statistics.generation_trace_binary = load_kernel('ex4dgs_generation_publication', cache)
-            self.window_statistics.generation_view = model.view
-            self.window_statistics.generation_span = (
-                float(model.config.get('stability_far', model.config['far'])) -
-                float(model.config.get('stability_near', model.config['near'])))
-            # Finish immutable checkpoint preparation before another stream
-            # can submit inference through this renderer.
-            torch.cuda.current_stream(model.xyz.device).synchronize()
+        )
+        statistics = DepthStatistics(load_kernel('depth', self.cache), self.ops)
+        statistics.generation_binary = load_kernel('ex4dgs_generation', self.cache)
+        statistics.generation_trace_binary = load_kernel('ex4dgs_generation_publication', self.cache)
+        statistics.generation_view = model.view
+        statistics.generation_span = (
+            float(model.config.get('stability_far', model.config['far'])) -
+            float(model.config.get('stability_near', model.config['near'])))
+        # Publish immutable prepared tensors only after their CUDA writes finish.
+        self.torch.cuda.current_stream(model.xyz.device).synchronize()
+        self._window_statistics = statistics
+        self._generation_parameters = parameters
+
+    @property
+    def generation_parameters(self):
+        self._prepare_dataflow_generation()
+        return self._generation_parameters
+
+    @property
+    def window_statistics(self):
+        self._prepare_dataflow_generation()
+        return self._window_statistics
 
     def generate(self, model, times):
         if hasattr(model, 'selected_dynamic'):
@@ -287,6 +356,22 @@ class CUDARenderer:
                                  rotation, model.scales, model.opacity,
                                  model.opacity_center, variance, times,
                                  model.duration, model.interval, model.time_shift, float(model.config["var_pad"]))
+
+    def generate_baseline(self, model, times):
+        """Evaluate independent Ex4DGS frames from the original keyframe layout.
+
+        The baseline computes interpolation constants at the requested time.
+        Prepared keyframe fields remain available to the Dataflow path.
+        """
+        if hasattr(model, "motion_rotation"):
+            return self.ops.generate(
+                model.xyz, model.displacement, model.motion, model.rotation,
+                model.motion_rotation, model.scales, model.opacity,
+                model.opacity_center, model.opacity_variance, times,
+                model.duration, model.interval, model.time_shift,
+                float(model.config["var_pad"]),
+            )
+        return self.generate(model, times)
 
     def project(self, model, geometry, defer_colors=False):
         from gsplat.cuda._wrapper import fully_fused_projection

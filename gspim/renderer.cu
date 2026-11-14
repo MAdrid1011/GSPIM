@@ -6,6 +6,9 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <cub/cub.cuh>
 #include <cuda_runtime.h>
+#if CUDART_VERSION >= 13000
+#include <cuda/iterator>
+#endif
 #include <math_constants.h>
 #include <torch/extension.h>
 #include <vector>
@@ -319,8 +322,8 @@ __global__ void generate_kernel(const float *xyz, const float *disp,
       ++n;
     }
 }
-// Keyframe constants are independent of the requested timestamp. Both the
-// independent-frame and window paths consume the same initialized parameters.
+// Keyframe constants are independent of the requested timestamp. Dataflow
+// consumes these prepared parameters; baseline frames use original keyframes.
 // Positions, normalized rotations and pair angles use key/field/primitive order
 // so a warp evaluating one timestamp reads contiguous FP32 fields.
 __global__ void prepare_generation_kernel(const float *rotation,
@@ -433,10 +436,18 @@ std::tuple<Tensor, Tensor, int64_t> classify(Tensor score) {
     return {stable, unstable, -1};
   auto counts = torch::empty({2}, integers);
   auto stream = at::cuda::getCurrentCUDAStream();
+#if CUDART_VERSION >= 13000
+  auto ids = cuda::make_counting_iterator(0);
+  auto stable_flags = cuda::make_transform_iterator(
+      score.data_ptr<float>(), StabilityFlag{true});
+  auto unstable_flags = cuda::make_transform_iterator(
+      score.data_ptr<float>(), StabilityFlag{false});
+#else
   cub::CountingInputIterator<int> ids(0);
   using Flags = cub::TransformInputIterator<bool, StabilityFlag, const float *>;
   Flags stable_flags(score.data_ptr<float>(), StabilityFlag{true});
   Flags unstable_flags(score.data_ptr<float>(), StabilityFlag{false});
+#endif
   size_t bytes = 0;
   cub::DeviceSelect::Flagged(nullptr, bytes, ids, stable_flags,
                             stable.data_ptr<int>(), counts.data_ptr<int>(), N,
@@ -498,9 +509,15 @@ std::tuple<Tensor, bool> visible_order_impl(Tensor order, Tensor radii,
     return {selected, false};
   auto summary = torch::zeros({2}, order.options().dtype(torch::kInt32));
   auto stream = at::cuda::getCurrentCUDAStream();
+#if CUDART_VERSION >= 13000
+  auto flags = cuda::make_transform_iterator(
+      order.data_ptr<Index>(), WindowVisible<Index>{
+          (int2 *)radii.data_ptr<int>(), N, W});
+#else
   using Flags = cub::TransformInputIterator<bool, WindowVisible<Index>, const Index *>;
   Flags flags(order.data_ptr<Index>(), WindowVisible<Index>{
       (int2 *)radii.data_ptr<int>(), N, W});
+#endif
   size_t bytes = 0;
   cub::DeviceSelect::Flagged(nullptr, bytes, order.data_ptr<Index>(), flags,
       selected.data_ptr<int64_t>(), summary.data_ptr<int>(), capacity, stream);
@@ -566,12 +583,12 @@ __device__ __forceinline__ bool tile_visible(float2 p, float3 conic, float opaci
 
 __global__ void ordered_tile_counts(const float2 *xy, const int2 *radii,
                                     const int64_t *order,
-                                    int N, int W, int tw, int th, int ts, int *counts,
+                                    int N, int S, int W, int tw, int th, int ts, int *counts,
                                     bool shared) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= N * (shared ? 1 : W))
     return;
-  int f = i / N, g = f * N + order[i];
+  int f = i / N, g = f * S + order[i];
   int2 r = radii[g];
   counts[i] = 0;
   if (shared || (r.x > 0 && r.y > 0)) {
@@ -585,8 +602,8 @@ __global__ void ordered_tile_counts(const float2 *xy, const int2 *radii,
       ymin = th;
       xmax = ymax = 0;
       for (int frame = 0; frame < W; ++frame) {
-        float2 center = xy[frame * N + g];
-        int2 radius = radii[frame * N + g];
+        float2 center = xy[frame * S + g];
+        int2 radius = radii[frame * S + g];
         if (radius.x <= 0 || radius.y <= 0)
           continue;
         xmin =
@@ -606,7 +623,7 @@ template <typename Key>
 __global__ void ordered_tile_write(const float2 *xy, const int2 *radii,
                                    const int64_t *order,
                                    const int64_t *assignment, const int *scan,
-                                   int N, int W, int tw, int th, int ts,
+                                   int N, int S, int W, int tw, int th, int ts,
                                    bool shared, Key *keys, int *ids) {
   constexpr int Lanes = 8;
   int lane = threadIdx.x % Lanes;
@@ -616,13 +633,13 @@ __global__ void ordered_tile_write(const float2 *xy, const int2 *radii,
   int g = 0, image = 0, start = 0, xmin = 0, xmax = 0, ymin = 0, ymax = 0;
   if (!lane) {
     int f = i / N;
-    g = f * N + order[i];
+    g = f * S + order[i];
     image = shared ? assignment[i] : assignment[i] * W + f;
     start = scan[i];
     xmin = tw;
     ymin = th;
     for (int frame = 0; frame < (shared ? W : 1); ++frame) {
-      int j = shared ? frame * N + g : g;
+      int j = shared ? frame * S + g : g;
       int2 r = radii[j];
       if (r.x <= 0 || r.y <= 0)
         continue;
@@ -656,7 +673,7 @@ std::vector<Tensor> ordered_tiles_impl(Tensor xy, Tensor radii, Tensor order,
                                   Tensor assignment, int tw, int th,
                                   int ts, bool shared) {
   c10::cuda::CUDAGuard guard(xy.device());
-  int W = order.size(0), N = order.size(1);
+  int W = order.size(0), N = order.size(1), S = xy.size(1);
   auto stream = at::cuda::getCurrentCUDAStream();
   int totaln = N * (shared ? 1 : W);
   auto key_options = xy.options().dtype(sizeof(Key) == 4 ? torch::kInt32
@@ -668,7 +685,7 @@ std::vector<Tensor> ordered_tiles_impl(Tensor xy, Tensor radii, Tensor order,
        scan = torch::empty_like(cnt);
   ordered_tile_counts<<<(totaln + 255) / 256, 256, 0, stream>>>(
       (float2 *)xy.data_ptr<float>(), (int2 *)radii.data_ptr<int>(),
-      order.data_ptr<int64_t>(), N, W, tw,
+      order.data_ptr<int64_t>(), N, S, W, tw,
       th, ts, cnt.data_ptr<int>(), shared);
   size_t bytes = 0;
   cub::DeviceScan::ExclusiveSum(nullptr, bytes, cnt.data_ptr<int>(),
@@ -689,7 +706,7 @@ std::vector<Tensor> ordered_tiles_impl(Tensor xy, Tensor radii, Tensor order,
   ordered_tile_write<Key><<<(totaln + 31) / 32, 256, 0, stream>>>(
       (float2 *)xy.data_ptr<float>(), (int2 *)radii.data_ptr<int>(),
       order.data_ptr<int64_t>(), assignment.data_ptr<int64_t>(),
-      scan.data_ptr<int>(), N, W, tw, th, ts, shared, keys.data_ptr<Key>(),
+      scan.data_ptr<int>(), N, S, W, tw, th, ts, shared, keys.data_ptr<Key>(),
       ids.data_ptr<int>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {keys, ids};
@@ -738,7 +755,7 @@ __device__ __forceinline__ bool tile_visible_bound(float2 p, float3 conic, float
   return !(lower > cutoff);
 }
 
-template <bool SubtileMasks = false, typename Key = int64_t>
+template <bool SubtileMasks = false, typename Key = int64_t, bool Sentinel = false>
 __global__ void cull_tile_flags(const Key *keys, int *ids, const float2 *xy,
                                 const float3 *conics, const float *opacity,
                                 int n, int tile_shift, int drop_bits, int tw,
@@ -803,7 +820,14 @@ __global__ void cull_tile_flags(const Key *keys, int *ids, const float2 *xy,
   }
   // Spare ID bits hold the eight 8x4 pixel-region bits. The host enables
   // this only when both primitive IDs and all frame bits still fit int32.
-  flags[i] = mask != 0;
+  if constexpr (Sentinel) {
+    // A stable tile sort puts rejected records beyond the real tile range.
+    // Keep their storage on the GPU to avoid a count readback and barrier.
+    if (!mask)
+      const_cast<Key *>(keys)[i] = (Key(1) << tile_shift) - 1;
+  } else {
+    flags[i] = mask != 0;
+  }
   ids[i] = g | (mask << id_bits);
   if (SubtileMasks)
     ids[i] |= regions << (id_bits + W);
@@ -822,7 +846,7 @@ template <typename Key>
 std::vector<Tensor> cull_tiles_impl(Tensor keys, Tensor ids, Tensor xy,
                                Tensor conics, Tensor opacity, int tw, int th,
                                int ts, int drop_bits, Tensor radii,
-                               int id_bits) {
+                               int id_bits, bool compact = true) {
   c10::cuda::CUDAGuard guard(xy.device());
   int n = ids.numel(), shift = 0;
   if (!n)
@@ -830,8 +854,10 @@ std::vector<Tensor> cull_tiles_impl(Tensor keys, Tensor ids, Tensor xy,
   while ((1 << shift) <= tw * th)
     ++shift;
   auto stream = at::cuda::getCurrentCUDAStream();
-  auto flags = torch::empty_like(ids), scan = torch::empty_like(ids);
   bool masked = id_bits > 0 && id_bits + xy.size(0) + 8 <= 32;
+  bool sentinel = masked && !compact && !drop_bits;
+  auto flags = torch::empty({sentinel ? 0 : n}, ids.options());
+  auto scan = torch::empty_like(flags);
   Tensor support;
   if (masked) {
     support = torch::empty({xy.size(0) * xy.size(1), 4}, xy.options());
@@ -840,13 +866,18 @@ std::vector<Tensor> cull_tiles_impl(Tensor keys, Tensor ids, Tensor xy,
         opacity.data_ptr<float>(), (float4 *)support.data_ptr<float>(),
         xy.size(0) * xy.size(1), ts);
   }
-  auto kernel = masked ? cull_tile_flags<true, Key> : cull_tile_flags<false, Key>;
+  auto kernel = sentinel ? cull_tile_flags<true, Key, true>
+                        : masked ? cull_tile_flags<true, Key> : cull_tile_flags<false, Key>;
   kernel<<<(n + 255) / 256, 256, 0, stream>>>(
       keys.data_ptr<Key>(), ids.data_ptr<int>(),
       (float2 *)xy.data_ptr<float>(), (float3 *)conics.data_ptr<float>(),
       opacity.data_ptr<float>(), n, shift, drop_bits, tw, ts,
       flags.data_ptr<int>(), (int2 *)radii.data_ptr<int>(), xy.size(1),
       xy.size(0), id_bits, masked ? (float4 *)support.data_ptr<float>() : nullptr);
+  if (sentinel) {
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return {keys, ids};
+  }
   size_t bytes = 0;
   cub::DeviceScan::ExclusiveSum(nullptr, bytes, flags.data_ptr<int>(),
                                 scan.data_ptr<int>(), n, stream);
@@ -873,12 +904,12 @@ std::vector<Tensor> cull_tiles_impl(Tensor keys, Tensor ids, Tensor xy,
 std::vector<Tensor> cull_tiles(Tensor keys, Tensor ids, Tensor xy,
                                Tensor conics, Tensor opacity, int tw, int th,
                                int ts, int drop_bits, Tensor radii,
-                               int id_bits) {
+                               int id_bits, bool compact = true) {
   if (keys.scalar_type() == torch::kInt32)
     return cull_tiles_impl<int>(keys, ids, xy, conics, opacity, tw, th, ts,
-                                drop_bits, radii, id_bits);
+                                drop_bits, radii, id_bits, compact);
   return cull_tiles_impl<int64_t>(keys, ids, xy, conics, opacity, tw, th, ts,
-                                drop_bits, radii, id_bits);
+                                drop_bits, radii, id_bits, compact);
 }
 
 __global__ void shift_keys(const int64_t *input, int64_t *output, int n,
@@ -2191,9 +2222,15 @@ std::vector<Tensor> shared_sequence(Tensor orders, Tensor stable) {
   auto stream = at::cuda::getCurrentCUDAStream();
   if (ns) stable_ranks_kernel<<<(ns+255)/256,256,0,stream>>>(
       stable.data_ptr<int>(), ns, ranks.data_ptr<int>());
+#if CUDART_VERSION >= 13000
+  auto indices = cuda::make_counting_iterator(0);
+  auto flags = cuda::make_transform_iterator(
+      indices, UnstablePosition{orders.data_ptr<int64_t>(),ranks.data_ptr<int>()});
+#else
   cub::CountingInputIterator<int> indices(0);
   using Flags = cub::TransformInputIterator<bool, UnstablePosition, cub::CountingInputIterator<int>>;
   Flags flags(indices, UnstablePosition{orders.data_ptr<int64_t>(),ranks.data_ptr<int>()});
+#endif
   size_t bytes = 0;
   cub::DeviceSelect::Flagged(nullptr,bytes,indices,flags,positions.data_ptr<int>(),
                               count.data_ptr<int>(),W*N,stream);
@@ -2253,7 +2290,234 @@ Tensor merge(Tensor stable, Tensor unstable, Tensor minimum, Tensor depth) {
   return result;
 }
 
+// Keep shared-order batch planning on the native side to avoid repeated
+// Python dispatch between dependent CUDA operators. The order, lossless
+// fields, L2 accounting and compositor are unchanged.
+static int field_bits(int64_t n) {
+  int bits = 0; while (n) { ++bits; n >>= 1; } return bits;
+}
+std::tuple<Tensor, int64_t, int64_t> shared_window(
+    Tensor means, Tensor radii, Tensor xy, Tensor conics, Tensor colors, Tensor opacity,
+    Tensor selected, Tensor sh, Tensor camera, int width, int height,
+    int64_t l2_bytes, float background, Tensor output, int64_t wait_event,
+    c10::optional<Tensor> frames, c10::optional<Tensor> temporal_mu) {
+  c10::cuda::CUDAGuard guard(xy.device());
+  TORCH_CHECK(selected.dim() == 1 && selected.device() == xy.device(),
+              "shared order must contain device-local primitive IDs");
+  selected = selected.to(torch::kInt64);
+  radii = radii.index_select(1, selected);
+  xy = xy.index_select(1, selected);
+  conics = conics.index_select(1, selected);
+  opacity = opacity.index_select(1, selected);
+  if (colors.numel()) colors = colors.index_select(1, selected);
+  int W = xy.size(0), N = xy.size(1), tw = (width + 15) / 16, th = (height + 15) / 16;
+  auto order = torch::arange(N, selected.options()).unsqueeze(0).expand({W, N});
+  auto layout = N ? packed_layout(xy, radii, conics, opacity) : order.new_empty({0});
+  auto zeros = order.new_zeros({1, N}).expand({W, N});
+  auto records = ordered_tiles(xy, radii, order, zeros, 1, tw, th, 16, true);
+  records = cull_tiles(records[0], records[1], xy, conics, opacity, tw, th, 16, 0, radii, field_bits(N));
+  auto properties = at::cuda::getDeviceProperties(xy.get_device());
+  bool masked = N > 0 && field_bits(N) + W + 8 <= 32;
+  int parts = masked ? 2 : 1;
+  int64_t resident = std::min(int64_t(properties->multiProcessorCount) * raster_blocks(xy, masked), int64_t(W) * tw * th * parts);
+  int64_t reserved = resident * (256 / parts) * (W > 1 || masked ? 16 : 17);
+  reserved += W * tw * th * (masked ? 4 : 1);
+  reserved += int64_t(tw) * th * 12 + 4 + (N ? 16 : 0);
+  TORCH_CHECK_VALUE(l2_bytes > reserved, "L2 cannot hold the resident raster state");
+  auto prefix = N ? tile_batch_prefix(layout, records[1], field_bits(N)) : order.new_zeros({1});
+  auto plan = bounded_batches(prefix, l2_bytes - reserved, W);
+  auto assignment = std::get<0>(plan);
+  int B = std::get<1>(plan);
+  int64_t footprint = std::get<2>(plan) + reserved;
+  auto keys = tile_batch_keys(records[0], records[1], assignment[0], field_bits(N), field_bits(tw * th), B);
+  auto sorted = radix(keys, records[1], 0, field_bits(tw * th) + field_bits(B));
+  bool packed_jobs = field_bits(N) > 0 && field_bits(N) + W + 8 <= 32;
+  auto ranges = tile_ranges(sorted[0], 1, B, tw * th, 0, packed_jobs);
+  auto boundaries_gpu = torch::searchsorted(assignment[0], torch::arange(B + 1, order.options())).cpu();
+  std::vector<int64_t> boundaries(boundaries_gpu.data_ptr<int64_t>(), boundaries_gpu.data_ptr<int64_t>() + B + 1);
+  if (wait_event)
+    C10_CUDA_CHECK(cudaStreamWaitEvent(at::cuda::getCurrentCUDAStream(), reinterpret_cast<cudaEvent_t>(wait_event), 0));
+  auto image = batches(xy, conics, colors, opacity, std::get<1>(ranges), sorted[1],
+      width, height, B, std::get<0>(ranges), std::get<2>(ranges),
+      sorted[1].numel() > 64 * std::get<0>(ranges).numel(), field_bits(N), means, sh, camera, order,
+      boundaries, true, selected, layout, output, background, frames, temporal_mu);
+  return {image, B, footprint};
+}
+
+struct DrainCandidate { float4 geometry, color, extra; };
+__device__ __forceinline__ float drain_exp(float exponent) {
+  float result;
+  asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(exponent));
+  return result;
+}
+template<int Warps>
+__global__ void tile_drain(const float2* xy,const float3* conic,const float3* colors,const float* opacity,
+    const int* ids,const int* offsets,int N,int bits,int W,int width,int height,float4* image,float background) {
+  constexpr int Pixels=4;constexpr unsigned AllPixels=85;
+  int lane=threadIdx.x%32,local_warp=threadIdx.x/32;
+  int task=blockIdx.x*Warps+local_warp;
+  int tw=(width+15)/16,tiles=tw*((height+15)/16);
+  for(;task<tiles*W*2;task+=gridDim.x*Warps) {
+  int tile=task/(W*2),f=(task/2)%W,half=task%2;
+  int x=(tile%tw)*16+half*8+lane%8,y=(tile/tw)*16+lane/8;
+
+  float T[Pixels];float3 C[Pixels];unsigned done_bits=0;
+#pragma unroll
+  for(int q=0;q<Pixels;++q) {
+    if(x>=width||y+q*4>=height)done_bits|=1u<<(q*2);
+    T[q]=1;C[q]=make_float3(0,0,0);
+  }
+  __shared__ DrainCandidate staged[Warps*32];
+  float stop_threshold=.0001f;
+
+  int lo=offsets[tile],hi=offsets[tile+1];
+  {
+    for(int base=lo;base<hi;base+=32) {
+    if(__all_sync(0xffffffff,done_bits==AllPixels))break;
+
+    if(base+lane<hi) {
+      unsigned encoded=ids[base+lane];int source=encoded&((1u<<bits)-1);
+      int g=f*N+source;
+      float2 p=xy[g];float3 a=conic[g],c=colors[g];float op=opacity[g];
+      if(!((encoded>>bits)&(1u<<f)))op=0;
+      DrainCandidate value={make_float4(p.x,p.y,a.x,a.y),make_float4(a.z,op,c.x,c.y),make_float4(c.z,__log2f(op),0,0)};
+      unsigned mask=(encoded>>(bits+W+half))&0x55u;
+      value.extra.z=__uint_as_float(value.color.y>0?mask:0);
+      value.geometry.z=__fmul_rn(-.7213475204444817f,value.geometry.z);
+      value.geometry.w=__fmul_rn(-1.4426950408889634f,value.geometry.w);
+      value.color.x=__fmul_rn(-.7213475204444817f,value.color.x);
+      staged[local_warp*32+lane]=value;
+    }
+    __syncwarp();
+    int total=min(32,hi-base);
+    #pragma unroll 2
+    for(int k=0;k<total;++k) {
+      DrainCandidate value=staged[local_warp*32+k];
+      unsigned active=__float_as_uint(value.extra.z)&~done_bits;
+      float2 p=make_float2(value.geometry.x,value.geometry.y);
+      float3 a=make_float3(value.geometry.z,value.geometry.w,value.color.x);
+      float3 col=make_float3(value.color.z,value.color.w,value.extra.x);
+      float cutoff=value.extra.y;
+        float dx = p.x - (x + .5f);
+        float xhalf = __fmaf_rn(__fmul_rn(a.x,dx),dx,cutoff);
+        float yhalf = a.z;
+        float cross = __fmul_rn(a.y, dx);
+#pragma unroll
+        for (int q = 0; q < Pixels; ++q) {
+          if (!(active & (1u << (q * 2))))
+            continue;
+          float dy = p.y - (y + q * 4 + .5f);
+          // Four pixel rows share the x term and the candidate fields.
+          float sigma = __fmaf_rn(dy, __fmaf_rn(dy, yhalf, cross), xhalf);
+          float alpha = fminf(.999f, drain_exp(sigma));
+          if (sigma > cutoff || alpha < 1.f / 255.f)
+            continue;
+          float next = __fmaf_rn(-alpha,T[q],T[q]);
+          if (stop_threshold > 0 && next <= stop_threshold) {
+            done_bits |= 1u << (q * 2);
+            continue;
+          }
+          float w = alpha * T[q];
+          C[q].x += col.x * w;
+          C[q].y += col.y * w;
+          C[q].z += col.z * w;
+          T[q] = next;
+      }
+    }
+    __syncwarp();
+    }
+
+  }
+#pragma unroll
+  for(int q=0;q<Pixels;++q)if(x<width&&y+q*4<height) {
+    int pixel=(f*height+y+q*4)*width+x;float b=background*T[q];
+    __stcs(image+pixel,make_float4(C[q].x+b,C[q].y+b,C[q].z+b,0));
+  }
+
+  }
+}
+
+
+// Each warp drains one tile/frame half in 32-candidate chunks. Its pixel
+// accumulators stay in registers; no intermediate image is stored per chunk.
+std::tuple<Tensor,int64_t,int64_t> shared_window_streamed(
+    Tensor means, Tensor radii, Tensor xy, Tensor conics, Tensor colors, Tensor opacity,
+    Tensor selected, Tensor sh, Tensor camera, int width, int height,
+    int64_t l2_bytes, float background, Tensor output, int64_t wait_event,
+    c10::optional<Tensor> frames, c10::optional<Tensor> temporal_mu,
+    bool source_fields = false) {
+  c10::cuda::CUDAGuard guard(xy.device());
+  TORCH_CHECK(width > 0 && height > 0 && l2_bytes > 0,
+              "positive image dimensions and L2 budget required");
+  TORCH_CHECK(selected.dim() == 1 && selected.device() == xy.device(),
+              "shared order must contain device-local primitive IDs");
+  TORCH_CHECK(!output.numel() || (output.is_contiguous() && output.dim() == 4 &&
+              output.size(0) == xy.size(0) && output.size(1) == height &&
+              output.size(2) == width && output.size(3) == 4),
+              "padded contiguous window output required");
+  int W=xy.size(0),N=selected.numel(),tw=(width+15)/16,th=(height+15)/16,tiles=tw*th;
+  // The temporally selected Ex4DGS layout benefits from dense, ordered
+  // fields; anchored/explicit layouts can avoid that repeated materialization.
+  bool indirect=source_fields&&field_bits(xy.size(1))+W+8<=32;
+  int bits=field_bits(indirect?xy.size(1):N);
+  // The encoded IDs include all frame and 8x4-region masks.
+  if(W<1 || W>5 || bits+W+8>32)
+    return shared_window(means,radii,xy,conics,colors,opacity,selected,sh,camera,
+                         width,height,l2_bytes,background,output,wait_event,frames,temporal_mu);
+  auto props=at::cuda::getDeviceProperties(xy.get_device());
+  int active=0;
+  C10_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&active,tile_drain<4>,128,0));
+  // Per warp: at most six 32-byte attribute sectors per candidate, a
+  // misaligned ID chunk, two offset sectors and four rows of output stores.
+  // This bounds the current streaming chunk, not the full scene arrays.
+  constexpr int64_t per_warp=32*6*32+192+64+2560;
+  int64_t reserved=int64_t(tiles+1)*4;
+  int64_t cap=(l2_bytes-reserved)/(4*per_warp);
+  if(cap<=0)
+    return shared_window(means,radii,xy,conics,colors,opacity,selected,sh,camera,
+                         width,height,l2_bytes,background,output,wait_event,frames,temporal_mu);
+  int blocks=std::min(int64_t(props->multiProcessorCount)*active,cap);
+  if(blocks>=props->multiProcessorCount)
+    blocks=blocks/props->multiProcessorCount*props->multiProcessorCount;
+  int tasks=tiles*W*2;
+  blocks=std::min(blocks,(tasks+3)/4);
+  // Match existing color evaluation before gathering selected projections.
+  if(!colors.numel())
+    colors=frames.has_value()?temporal_colors(means[0],radii,sh,camera,*frames,*temporal_mu)
+                              :batch_colors(means,radii,sh,camera);
+  selected=selected.to(torch::kInt64);
+  if(!indirect) {
+    radii=radii.index_select(1,selected);xy=xy.index_select(1,selected);
+    conics=conics.index_select(1,selected);opacity=opacity.index_select(1,selected);
+    colors=colors.index_select(1,selected);
+  }
+  auto order=(indirect?selected:torch::arange(N,selected.options())).unsqueeze(0).expand({W,N});
+  auto assignment=order.new_zeros({1,N}).expand({W,N});
+  auto records=ordered_tiles(xy,radii,order,assignment,1,tw,th,16,true);
+  records=cull_tiles(records[0],records[1],xy,conics,opacity,tw,th,16,0,radii,bits,false);
+  auto sorted=radix(records[0],records[1],0,field_bits(tiles));
+  auto offsets=torch::searchsorted(sorted[0],torch::arange(tiles+1,sorted[0].options())).to(torch::kInt32);
+  if(wait_event)
+    C10_CUDA_CHECK(cudaStreamWaitEvent(at::cuda::getCurrentCUDAStream(),reinterpret_cast<cudaEvent_t>(wait_event),0));
+  auto image=output.numel()?output:xy.new_empty({W,height,width,4});
+  tile_drain<4><<<blocks,128,0,at::cuda::getCurrentCUDAStream()>>>(
+    (float2*)xy.data_ptr<float>(),(float3*)conics.data_ptr<float>(),(float3*)colors.data_ptr<float>(),
+    opacity.data_ptr<float>(),sorted[1].data_ptr<int>(),offsets.data_ptr<int>(),xy.size(1),bits,W,width,height,
+    (float4*)image.data_ptr<float>(),background);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  int64_t waves=(tasks+blocks*4-1)/(blocks*4);
+  return {image.index({torch::indexing::Ellipsis,torch::indexing::Slice(0,3)}),waves,reserved+blocks*4*per_warp};
+}
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("shared_window_streamed", &shared_window_streamed,
+      pybind11::arg("means"), pybind11::arg("radii"), pybind11::arg("xy"),
+      pybind11::arg("conics"), pybind11::arg("colors"), pybind11::arg("opacity"),
+      pybind11::arg("selected"), pybind11::arg("sh"), pybind11::arg("camera"),
+      pybind11::arg("width"), pybind11::arg("height"), pybind11::arg("l2_bytes"),
+      pybind11::arg("background"), pybind11::arg("output"), pybind11::arg("wait_event"),
+      pybind11::arg("frames"), pybind11::arg("temporal_mu"),
+      pybind11::arg("source_fields") = false);
+  m.def("shared_window", &shared_window);
   m.def("shared_sequence", &shared_sequence);
   m.def("generate_anchored", &generate_anchored);
   m.def("merge", &merge);
@@ -2284,7 +2548,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("tile_batch_prefix", &tile_batch_prefix);
   m.def("tile_batch_keys", &tile_batch_keys);
   m.def("bounded_batches", &bounded_batches);
-  m.def("cull_tiles", &cull_tiles);
+  m.def("cull_tiles", [](Tensor keys, Tensor ids, Tensor xy, Tensor conics,
+      Tensor opacity, int tw, int th, int ts, int drop_bits, Tensor radii, int bits) {
+    return cull_tiles(keys, ids, xy, conics, opacity, tw, th, ts, drop_bits, radii, bits);
+  });
   m.def("batch_colors", &batch_colors);
   m.def("temporal_colors", &temporal_colors);
   m.def("projection_finish", &projection_finish);

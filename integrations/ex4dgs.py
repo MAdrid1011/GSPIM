@@ -67,8 +67,10 @@ class Ex4DGSCheckpoint:
         self.motion = numbered(dynamic, "motion_xyz_").reshape(len(dynamic), -1, 3)
         self.rotation = numbered(static, "rot_")
         self.motion_rotation = numbered(dynamic, "motion_rot_").reshape(len(dynamic), -1, 4)
-        self.scales = torch.cat((numbered(static, "scale_"), numbered(dynamic, "motion_scale_"))).exp()
-        self.opacity = torch.cat((fields(static, ("opacity",)), fields(dynamic, ("motion_opacity",)))).sigmoid().flatten()
+        self.log_scales = torch.cat((numbered(static, "scale_"), numbered(dynamic, "motion_scale_")))
+        self.opacity_logits = torch.cat((fields(static, ("opacity",)), fields(dynamic, ("motion_opacity",))))
+        self.scales = self.log_scales.exp()
+        self.opacity = self.opacity_logits.sigmoid().flatten()
         self.opacity_center = numbered(dynamic, "motion_opacity_c_")
         self.opacity_variance = numbered(dynamic, "motion_opacity_v_")
         coefficients = []
@@ -114,6 +116,22 @@ class Ex4DGSCheckpoint:
         bounds[:, 1] += 2 ** -20
         bounds[amplitude < cutoff] = self.duration / 30 + 1
         self.temporal_intervals = bounds.float()
+
+    baseline_implementation = "Ex4DGS raw-keyframe fused CUDA with per-frame activation/SH assembly + common CUDA/gsplat rendering"
+
+    def baseline_model(self):
+        """Restore upstream frame input preparation while retaining CUDA generation."""
+        from copy import copy
+        import torch
+
+        model = copy(self)
+        model.scales = self.log_scales.exp()
+        model.opacity = self.opacity_logits.sigmoid().flatten()
+        ns = len(self.xyz)
+        static, dynamic = self.sh[:ns], self.sh[ns:]
+        model.sh = torch.cat((torch.cat((static[:, :1], static[:, 1:]), dim=1),
+                              torch.cat((dynamic[:, :1], dynamic[:, 1:]), dim=1)), dim=0)
+        return model
 
     def select_dataflow(self, times, first=None):
         """Select conservative opacity support while preserving source keyframes."""

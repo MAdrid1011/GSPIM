@@ -658,7 +658,7 @@ class SegmentedAoS:
         else:
             physical_ids = self.binary.emit_ids(args[5])
         publication = self.binary.publish(physical_ids)
-        routed = self.spatial_source.routed[-1]
+        routed = self.spatial_source.routed[self.plan_cursor - 1]
         current = torch.cuda.current_stream()
         stream = self.producer_stream if self.producer_completion is not None else current
         if stream != current:
@@ -847,6 +847,7 @@ class ColorFieldBlocks:
     def reset(self):
         self.projections = {}
         self.pending = {}
+        self.streams = {}
         self.publications = []
         self.load_frontiers = []
         self.consumer.field_blocks = {}
@@ -874,9 +875,11 @@ class ColorFieldBlocks:
         if prepared is None:
             return self.original_fields(projected)
         cutoff, physical, visibility, blocks = prepared
-        publication = self.consumer.binary.publish(physical)
-        ready = torch.cuda.Event()
-        ready.record()
+        stream = self.streams.pop(key, torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            publication = self.consumer.binary.publish(physical)
+            ready = torch.cuda.Event()
+            ready.record()
         self.consumer.field_inputs[key] = (projected, cutoff, physical, publication, ready)
         self.consumer.field_visibility[key] = visibility
         self.consumer.field_blocks[key] = blocks
